@@ -30,3 +30,6 @@ ordered-float = "5"
 tokenizers = { version = "0.22", features = ["http"] }
 dirs = "6"
 toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

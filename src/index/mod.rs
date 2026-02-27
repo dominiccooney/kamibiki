@@ -1,17 +1,11 @@
+pub mod format;
+pub mod mmap;
+pub mod compact;
+
 use anyhow::Result;
 use crate::core::types::{BinaryEmbedding, ChunkRef, GitHash, IndexHeader};
 
-/// Trait for writing index files.
-pub trait IndexWriter {
-    /// Write an index file for the given commit.
-    fn write(
-        &self,
-        header: &IndexHeader,
-        file_entries: &[FileEntry],
-    ) -> Result<()>;
-}
-
-/// Trait for reading index files.
+/// Trait for reading index files (object-safe for dynamic dispatch).
 pub trait IndexReader {
     /// Read the index header.
     fn header(&self) -> &IndexHeader;
@@ -19,13 +13,13 @@ pub trait IndexReader {
     /// Return the total number of embeddings in this index.
     fn embedding_count(&self) -> usize;
 
-    /// Get the embedding at the given position.
+    /// Get the embedding at the given position (zero-copy for mmap).
     fn embedding(&self, index: usize) -> &BinaryEmbedding;
 
     /// Resolve an embedding index to a chunk reference.
     fn resolve_chunk_ref(&self, embedding_index: usize) -> Result<ChunkRef>;
 
-    /// Get the parent commit hash, if this is an overlay index.
+    /// Get the parent commit hash (all-zeroes if root index).
     fn parent_hash(&self) -> &GitHash;
 }
 
@@ -46,3 +40,7 @@ pub struct ChunkEntry {
     /// Binary quantized embedding.
     pub embedding: BinaryEmbedding,
 }
+
+// Re-exports for convenience.
+pub use format::write_index;
+pub use mmap::MmapIndexReader;
