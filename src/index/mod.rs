@@ -41,6 +41,25 @@ pub struct ChunkEntry {
     pub embedding: BinaryEmbedding,
 }
 
+/// Chunk layout info for a file, used during the indexing pipeline.
+/// This is the lightweight metadata produced by the chunking pass
+/// before embeddings are available.
+#[derive(Debug, Clone)]
+pub struct FileChunkInfo {
+    /// Position of this file in the git index.
+    pub git_index_position: usize,
+    /// Path relative to repo root.
+    pub path: String,
+    /// Length of each chunk in bytes.
+    pub chunk_lengths: Vec<u16>,
+}
+
+impl FileChunkInfo {
+    pub fn chunk_count(&self) -> usize {
+        self.chunk_lengths.len()
+    }
+}
+
 // Re-exports for convenience.
-pub use format::write_index;
+pub use format::{write_index, write_skeleton, index_layout, detect_incomplete, write_embeddings_at, IndexLayout};
 pub use mmap::MmapIndexReader;

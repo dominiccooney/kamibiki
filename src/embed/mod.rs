@@ -1,5 +1,9 @@
+pub mod voyage;
+
 use anyhow::Result;
 use crate::core::types::BinaryEmbedding;
+
+pub use voyage::VoyageEmbedder;
 
 /// Trait for embedding text into binary quantized vectors.
 pub trait Embedder: Send + Sync {

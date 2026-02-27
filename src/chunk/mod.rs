@@ -4,13 +4,24 @@ pub mod treesitter;
 use anyhow::Result;
 use std::sync::Arc;
 
-/// A chunk produced by a chunker. Chunks are non-overlapping and
-/// cover the file from byte 0 contiguously.
+/// A chunk produced by a chunker. Chunks are non-overlapping byte
+/// ranges that cover the file from byte 0 contiguously.
+///
+/// This is a zero-copy type — it references a range in the source
+/// content rather than owning a copy.
 pub struct Chunk {
     /// Byte offset of the start of this chunk in the source file.
     pub byte_offset: usize,
-    /// The chunk content as bytes (valid UTF-8 for text files).
-    pub content: Vec<u8>,
+    /// Length of this chunk in bytes.
+    pub len: usize,
+}
+
+impl Chunk {
+    /// Get the content of this chunk from the source buffer.
+    #[inline]
+    pub fn content<'a>(&self, source: &'a [u8]) -> &'a [u8] {
+        &source[self.byte_offset..self.byte_offset + self.len]
+    }
 }
 
 /// Trait for chunking file content into embeddable pieces.

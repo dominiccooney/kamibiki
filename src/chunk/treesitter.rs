@@ -76,9 +76,9 @@ fn chunk_with_tree_sitter(
     // Top-down recursive chunking from the root.
     let ranges = chunk_node(root, content, max_tokens, tc);
 
-    // Convert ranges to Chunk structs, ensuring contiguous coverage
-    // of [0, content.len()).
-    Ok(ranges_to_chunks(&ranges, content))
+    // Convert ranges to contiguous Chunk byte-ranges covering
+    // [0, content.len()).
+    Ok(ranges_to_chunks(&ranges, content.len()))
 }
 
 /// Parse content with tree-sitter, returning the parse tree.
@@ -130,9 +130,6 @@ fn boundary_score(content: &[u8], prev_end: usize, next_start: usize) -> u32 {
     }
     let gap = &content[prev_end..next_start];
     let blanks = count_blank_lines(gap);
-    // The first newline in the gap is typically just the line
-    // terminator for the previous node, not a true blank line.
-    // Subtract 1 to account for this.
     if blanks > 1 {
         100 + (blanks - 1) as u32
     } else {
@@ -180,14 +177,12 @@ fn chunk_node(
             .into_iter()
             .map(|c| Range {
                 start: node.start_byte() + c.byte_offset,
-                end: node.start_byte() + c.byte_offset + c.content.len(),
+                end: node.start_byte() + c.byte_offset + c.len,
             })
             .collect();
     }
 
     // Score boundaries between adjacent children.
-    // boundary_scores[i] is the score for the boundary between
-    // children[i-1] and children[i].
     let mut boundary_scores: Vec<u32> = vec![0]; // index 0 unused
     for i in 1..children.len() {
         let score = boundary_score(
@@ -198,16 +193,10 @@ fn chunk_node(
         boundary_scores.push(score);
     }
 
-    // Greedily merge children into groups. A group spans from the
-    // start of its first child to the end of its last child
-    // (including any gap bytes between them).
-    //
-    // When adding a child would exceed max_tokens, we pick the best
-    // break point within the current accumulation window.
+    // Greedily merge children into groups.
     let mut result: Vec<Range> = Vec::new();
     let mut group_start_idx: usize = 0;
 
-    // For tracking the best break point within the current window.
     let mut best_break_idx: Option<usize> = None;
     let mut best_break_score: u32 = 0;
 
@@ -220,16 +209,12 @@ fn chunk_node(
         let score = boundary_scores[i];
 
         if prospective_tokens > max_tokens && i > group_start_idx {
-            // Need to break. Use the best break point if available.
             let break_idx = if let Some(bi) = best_break_idx {
                 bi
             } else {
-                // No best break found (all scores 0, meaning stuck
-                // items). Break at the most recent boundary.
                 i
             };
 
-            // Emit the group [group_start_idx .. break_idx).
             emit_group(
                 &children,
                 group_start_idx,
@@ -244,8 +229,6 @@ fn chunk_node(
             best_break_idx = None;
             best_break_score = 0;
 
-            // Don't track boundary score for the current `i` if
-            // it's now the first item.
             if i > group_start_idx {
                 if score > best_break_score {
                     best_break_idx = Some(i);
@@ -256,8 +239,6 @@ fn chunk_node(
             continue;
         }
 
-        // Track best break point: prefer higher scores, and among
-        // equal scores prefer later positions (for bigger chunks).
         if i > group_start_idx && score >= best_break_score {
             best_break_idx = Some(i);
             best_break_score = score;
@@ -279,10 +260,6 @@ fn chunk_node(
 }
 
 /// Emit a group of children [start_idx..end_idx) as chunk ranges.
-///
-/// If the group fits within max_tokens, emit as a single range.
-/// If it's a single child that's oversized, recurse into it.
-/// If it's multiple children that are oversized, recurse into each.
 fn emit_group(
     children: &[Node],
     start_idx: usize,
@@ -301,7 +278,6 @@ fn emit_group(
     let group_tokens = tc.count(&content[group_start..group_end]);
 
     if group_tokens <= max_tokens {
-        // Fits in one chunk.
         result.push(Range {
             start: group_start,
             end: group_end,
@@ -311,15 +287,13 @@ fn emit_group(
         let sub = chunk_node(children[start_idx], content, max_tokens, tc);
         result.extend(sub);
     } else {
-        // Multiple children that together exceed max_tokens but we
-        // couldn't split them (all boundaries scored 0 = stuck).
+        // Multiple children that together exceed max_tokens.
         // Try each child individually.
         for idx in start_idx..end_idx {
             let child_tokens = tc.count(
                 &content[children[idx].start_byte()..children[idx].end_byte()],
             );
             if child_tokens <= max_tokens {
-                // Try to merge with the previous range if possible.
                 if let Some(last) = result.last_mut() {
                     let merged_tokens =
                         tc.count(&content[last.start..children[idx].end_byte()]);
@@ -340,140 +314,70 @@ fn emit_group(
     }
 }
 
-/// Convert ranges to Chunks, filling gaps between ranges with
-/// content from the source to maintain contiguous coverage of
-/// [0, content.len()).
-fn ranges_to_chunks(ranges: &[Range], content: &[u8]) -> Vec<Chunk> {
+/// Convert AST-derived ranges to contiguous Chunks covering
+/// [0, content_len).
+///
+/// Gaps between ranges are absorbed into the preceding chunk.
+/// Leading content before the first range becomes the start of the
+/// first chunk. Trailing content after the last range extends the
+/// last chunk.
+fn ranges_to_chunks(ranges: &[Range], content_len: usize) -> Vec<Chunk> {
     if ranges.is_empty() {
-        if content.is_empty() {
+        if content_len == 0 {
             return Vec::new();
         }
-        return vec![Chunk {
-            byte_offset: 0,
-            content: content.to_vec(),
-        }];
+        return vec![Chunk { byte_offset: 0, len: content_len }];
     }
 
-    let mut chunks: Vec<Chunk> = Vec::new();
-    let mut pos: usize = 0;
-
+    // Deduplicate/skip fully-overlapped ranges and collect valid ones.
+    let mut merged: Vec<Range> = Vec::new();
+    let mut pos = 0usize;
     for range in ranges {
-        let chunk_start = range.start;
-        let chunk_end = range.end;
-
-        if chunk_end <= chunk_start {
+        if range.end <= pos || range.end <= range.start {
             continue;
         }
-
-        // Try to merge with previous chunk if combined size is
-        // reasonable (avoids tiny gap-only chunks).
-        if let Some(last) = chunks.last_mut() {
-            let last_end = last.byte_offset + last.content.len();
-            if last_end == chunk_start {
-                // Adjacent — no gap, just continue.
-            } else if chunk_start < last_end {
-                // Overlap — skip already-covered bytes.
-                let new_start = last_end;
-                if chunk_end > new_start {
-                    chunks.push(Chunk {
-                        byte_offset: new_start,
-                        content: content[new_start..chunk_end].to_vec(),
-                    });
-                }
-                pos = chunk_end;
-                continue;
-            }
-        }
-
-        chunks.push(Chunk {
-            byte_offset: chunk_start,
-            content: content[chunk_start..chunk_end].to_vec(),
+        merged.push(Range {
+            start: range.start.max(pos),
+            end: range.end,
         });
-        pos = chunk_end;
+        pos = range.end;
     }
 
-    // Fill trailing gap.
-    if pos < content.len() {
-        if let Some(last) = chunks.last_mut() {
-            // Extend the last chunk to cover trailing whitespace.
-            let last_end = last.byte_offset + last.content.len();
-            if last_end < content.len() {
-                last.content
-                    .extend_from_slice(&content[last_end..content.len()]);
-            }
+    if merged.is_empty() {
+        if content_len == 0 {
+            return Vec::new();
+        }
+        return vec![Chunk { byte_offset: 0, len: content_len }];
+    }
+
+    // Create chunks: one per merged range. The first chunk starts at
+    // byte 0. Each subsequent chunk starts at the start of its range
+    // (absorbing any gap into the preceding chunk). The last chunk
+    // extends to content_len.
+    let mut chunks = Vec::with_capacity(merged.len());
+
+    for (i, range) in merged.iter().enumerate() {
+        let chunk_start = if i == 0 { 0 } else { range.start };
+        let chunk_end = if i + 1 < merged.len() {
+            merged[i + 1].start
         } else {
+            content_len
+        };
+
+        if chunk_end > chunk_start {
             chunks.push(Chunk {
-                byte_offset: 0,
-                content: content.to_vec(),
+                byte_offset: chunk_start,
+                len: chunk_end - chunk_start,
             });
         }
     }
 
-    // Final pass: merge gaps into adjacent chunks to ensure
-    // contiguous coverage.
-    consolidate_chunks(chunks, content)
-}
-
-/// Ensure chunks are contiguous from byte 0 to content.len().
-/// Fills any gaps by extending the preceding chunk.
-fn consolidate_chunks(chunks: Vec<Chunk>, content: &[u8]) -> Vec<Chunk> {
-    if chunks.is_empty() {
-        if content.is_empty() {
-            return Vec::new();
-        }
-        return vec![Chunk {
-            byte_offset: 0,
-            content: content.to_vec(),
-        }];
+    // Edge case: ensure we cover from 0.
+    if chunks.is_empty() && content_len > 0 {
+        chunks.push(Chunk { byte_offset: 0, len: content_len });
     }
 
-    let mut result: Vec<Chunk> = Vec::new();
-    let mut pos: usize = 0;
-
-    for chunk in chunks {
-        if chunk.byte_offset > pos {
-            // There's a gap — extend the previous chunk or create a
-            // new one.
-            if let Some(last) = result.last_mut() {
-                // Extend the previous chunk to cover the gap.
-                last.content
-                    .extend_from_slice(&content[pos..chunk.byte_offset]);
-            } else {
-                // No previous chunk — create one for the leading gap.
-                result.push(Chunk {
-                    byte_offset: 0,
-                    content: content[0..chunk.byte_offset].to_vec(),
-                });
-            }
-        }
-
-        if chunk.byte_offset < pos {
-            // Overlap — skip already-covered prefix.
-            let skip = pos - chunk.byte_offset;
-            if skip < chunk.content.len() {
-                result.push(Chunk {
-                    byte_offset: pos,
-                    content: chunk.content[skip..].to_vec(),
-                });
-            }
-        } else {
-            result.push(chunk);
-        }
-
-        if let Some(last) = result.last() {
-            pos = last.byte_offset + last.content.len();
-        }
-    }
-
-    // Fill trailing gap.
-    if pos < content.len() {
-        if let Some(last) = result.last_mut() {
-            last.content
-                .extend_from_slice(&content[pos..content.len()]);
-        }
-    }
-
-    result
+    chunks
 }
 
 #[cfg(test)]
@@ -506,8 +410,8 @@ mod tests {
                 "gap at offset {expected_offset}, chunk starts at {}",
                 chunk.byte_offset
             );
-            assert!(!chunk.content.is_empty());
-            expected_offset += chunk.content.len();
+            assert!(chunk.len > 0);
+            expected_offset += chunk.len;
         }
         assert_eq!(expected_offset, content.len());
     }
@@ -515,9 +419,10 @@ mod tests {
     /// Verify the content of chunks matches the original source.
     fn assert_content_matches(chunks: &[Chunk], content: &[u8]) {
         for chunk in chunks {
+            let slice = chunk.content(content);
             let expected =
-                &content[chunk.byte_offset..chunk.byte_offset + chunk.content.len()];
-            assert_eq!(chunk.content, expected);
+                &content[chunk.byte_offset..chunk.byte_offset + chunk.len];
+            assert_eq!(slice, expected);
         }
     }
 
@@ -540,13 +445,11 @@ mod tests {
             .unwrap();
         assert_contiguous(&chunks, content);
         assert_content_matches(&chunks, content);
-        // Small file should be a single chunk.
         assert_eq!(chunks.len(), 1);
     }
 
     #[test]
     fn rust_file_with_multiple_functions() {
-        // Generate a file with many functions to exceed target size.
         let mut content = String::new();
         for i in 0..50 {
             content.push_str(&format!(
@@ -567,18 +470,14 @@ mod tests {
         assert_contiguous(&chunks, bytes);
         assert_content_matches(&chunks, bytes);
 
-        // Should have multiple chunks.
         assert!(
             chunks.len() > 1,
             "expected multiple chunks, got {}",
             chunks.len()
         );
 
-        // Each chunk should be roughly within max_tokens (with
-        // possible oversized atoms).
         for chunk in &chunks {
-            let chunk_tokens = tc.count(&chunk.content);
-            // Allow 2x for oversized atoms.
+            let chunk_tokens = tc.count(chunk.content(bytes));
             assert!(
                 chunk_tokens <= TEST_MAX_TOKENS * 2,
                 "chunk too large: {} tokens (max_tokens={})",
@@ -706,7 +605,6 @@ func add(a, b int) int {
 
     #[test]
     fn large_rust_file_chunking() {
-        // Generate a larger file to really test chunking behavior.
         let mut content = String::new();
         content.push_str("// This is a large Rust source file.\n\n");
         for i in 0..200 {
@@ -761,8 +659,6 @@ func add(a, b int) int {
 
     #[test]
     fn doc_comments_stay_with_function_rust() {
-        // Doc comments and attributes should not be separated from
-        // the function they annotate.
         let mut content = String::new();
         for i in 0..20 {
             content.push_str(&format!(
@@ -781,15 +677,14 @@ func add(a, b int) int {
         assert_contiguous(&chunks, bytes);
         assert_content_matches(&chunks, bytes);
 
-        // Verify no chunk starts in the middle of a
-        // doc-comment+attr+fn group. Each chunk should start either
-        // at byte 0 or at a "///" doc comment line.
         for chunk in &chunks {
             if chunk.byte_offset == 0 {
                 continue;
             }
-            let start_text = std::str::from_utf8(&chunk.content[..chunk.content.len().min(50)])
-                .unwrap_or("");
+            let content_slice = chunk.content(bytes);
+            let start_text = std::str::from_utf8(
+                &content_slice[..content_slice.len().min(50)]
+            ).unwrap_or("");
             assert!(
                 start_text.starts_with("///") || start_text.starts_with("fn "),
                 "chunk at offset {} starts with unexpected content: {:?}",
@@ -824,11 +719,8 @@ func Mul(a, b int) int {
         assert_contiguous(&chunks, content);
         assert_content_matches(&chunks, content);
 
-        // Check that no chunk starts with a bare "func" line (the
-        // preceding comment should be attached).
         for chunk in &chunks {
-            let text =
-                std::str::from_utf8(&chunk.content).unwrap_or("");
+            let text = std::str::from_utf8(chunk.content(content)).unwrap_or("");
             let first_non_ws = text.trim_start();
             if chunk.byte_offset > 0 {
                 assert!(
@@ -855,12 +747,63 @@ func Mul(a, b int) int {
     #[test]
     fn boundary_score_cases() {
         let content = b"aaa\n\nbbb";
-        // Gap between byte 3 and byte 5 is "\n\n" — 2 blank lines.
         assert!(boundary_score(content, 3, 5) > 100);
 
         let content2 = b"aaa\nbbb";
-        // Gap between byte 3 and byte 4 is "\n" — 0 blank lines
-        // (the newline ends the "aaa" line, "bbb" starts immediately).
         assert_eq!(boundary_score(content2, 3, 4), 0);
+    }
+
+    #[test]
+    fn ranges_to_chunks_empty() {
+        let chunks = ranges_to_chunks(&[], 0);
+        assert!(chunks.is_empty());
+
+        let chunks = ranges_to_chunks(&[], 10);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].byte_offset, 0);
+        assert_eq!(chunks[0].len, 10);
+    }
+
+    #[test]
+    fn ranges_to_chunks_single() {
+        let ranges = vec![Range { start: 0, end: 10 }];
+        let chunks = ranges_to_chunks(&ranges, 10);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].byte_offset, 0);
+        assert_eq!(chunks[0].len, 10);
+    }
+
+    #[test]
+    fn ranges_to_chunks_with_gaps() {
+        // Ranges [10..20, 30..40] in a 50-byte file.
+        // Should produce 2 chunks: [0..30) and [30..50).
+        let ranges = vec![
+            Range { start: 10, end: 20 },
+            Range { start: 30, end: 40 },
+        ];
+        let chunks = ranges_to_chunks(&ranges, 50);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].byte_offset, 0);
+        assert_eq!(chunks[0].len, 30);
+        assert_eq!(chunks[1].byte_offset, 30);
+        assert_eq!(chunks[1].len, 20);
+    }
+
+    #[test]
+    fn ranges_to_chunks_contiguous() {
+        let ranges = vec![
+            Range { start: 0, end: 10 },
+            Range { start: 10, end: 20 },
+            Range { start: 20, end: 30 },
+        ];
+        let chunks = ranges_to_chunks(&ranges, 30);
+        assert_eq!(chunks.len(), 3);
+        // Check contiguity.
+        let mut pos = 0;
+        for chunk in &chunks {
+            assert_eq!(chunk.byte_offset, pos);
+            pos += chunk.len;
+        }
+        assert_eq!(pos, 30);
     }
 }
