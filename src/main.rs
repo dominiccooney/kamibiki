@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
 
 use kb::chunk::{self, Chunker};
 use kb::core::config;
@@ -300,12 +301,22 @@ async fn index_repo(repo_cfg: &RepoConfig, api_key: &str) -> Result<()> {
 
     // ── Pass 1: Chunk all files to determine layout ──────────
 
-    eprintln!("  Chunking files...");
     let mut file_infos: Vec<FileChunkInfo> = Vec::new();
     let mut total_chunks = 0usize;
     let mut skipped = 0usize;
 
+    let chunk_pb = ProgressBar::new(entries.len() as u64);
+    chunk_pb.set_style(
+        ProgressStyle::with_template(
+            "  Chunking  {bar:40.cyan/dim} {pos}/{len} files  {elapsed_precise} [{eta_precise} remaining]"
+        )
+        .unwrap()
+        .progress_chars("━╸─"),
+    );
+
     for (git_idx, path) in &entries {
+        chunk_pb.inc(1);
+
         let content = match git::read_blob_at_head(&repo, path) {
             Ok(c) => c,
             Err(_) => { skipped += 1; continue; }
@@ -327,13 +338,16 @@ async fn index_repo(repo_cfg: &RepoConfig, api_key: &str) -> Result<()> {
             }
             Ok(_) => {} // empty
             Err(e) => {
-                eprintln!("  warn: chunking failed for {}: {}", path, e);
+                chunk_pb.suspend(|| {
+                    eprintln!("  warn: chunking failed for {}: {}", path, e);
+                });
                 skipped += 1;
             }
         }
     }
 
-    eprintln!("  Files to index: {}, total chunks: {}", file_infos.len(), total_chunks);
+    chunk_pb.finish_and_clear();
+    eprintln!("  Chunked: {} files → {} chunks", file_infos.len(), total_chunks);
     if skipped > 0 {
         eprintln!("  Skipped: {}", skipped);
     }
@@ -384,11 +398,6 @@ async fn index_repo(repo_cfg: &RepoConfig, api_key: &str) -> Result<()> {
     }
 
     let already_done = file_infos.len() - needs_work.len();
-    eprintln!(
-        "  Embedding {} files ({} already done)...",
-        needs_work.len(),
-        already_done
-    );
 
     // ── Pass 2: Pipeline — producer chunks, consumer embeds ──
 
@@ -457,8 +466,17 @@ async fn index_repo(repo_cfg: &RepoConfig, api_key: &str) -> Result<()> {
 
     // Consumer: embed each batch and write to the index file.
     let embedder = VoyageEmbedder::new(api_key.to_string());
-    let mut embedded_count = already_done;
     let total_files = file_infos.len();
+
+    let embed_pb = ProgressBar::new(total_files as u64);
+    embed_pb.set_position(already_done as u64);
+    embed_pb.set_style(
+        ProgressStyle::with_template(
+            "  Embedding {bar:40.green/dim} {pos}/{len} files  {elapsed_precise} [{eta_precise} remaining]"
+        )
+        .unwrap()
+        .progress_chars("━╸─"),
+    );
 
     while let Some(work) = rx.recv().await {
         match embedder.embed_documents(&work.documents).await {
@@ -472,19 +490,18 @@ async fn index_repo(repo_cfg: &RepoConfig, api_key: &str) -> Result<()> {
                         embeddings,
                     )?;
                 }
-                embedded_count += work.file_indices.len();
-                eprintln!(
-                    "  Progress: {}/{} files",
-                    embedded_count,
-                    total_files
-                );
+                embed_pb.inc(work.file_indices.len() as u64);
             }
             Err(e) => {
-                eprintln!("  error: embedding failed: {}. Progress saved, re-run to resume.", e);
+                embed_pb.suspend(|| {
+                    eprintln!("  error: embedding failed: {}. Progress saved, re-run to resume.", e);
+                });
                 break;
             }
         }
     }
+
+    embed_pb.finish_and_clear();
 
     // Wait for producer thread.
     match producer.join() {
