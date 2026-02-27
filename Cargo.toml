@@ -26,7 +26,7 @@ tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
 tree-sitter-java = "0.23"
 tree-sitter-ruby = "0.23"
-tree-sitter-kotlin = "0.3"
 ordered-float = "5"
+tokenizers = { version = "0.22", features = ["http"] }
 dirs = "6"
 toml = "0.8"
