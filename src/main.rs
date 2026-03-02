@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
-use kb::chunk::{self, Chunker};
+use kb::chunk::{self, Chunker, TokenCounter};
 use kb::core::config;
 use kb::core::git;
 use kb::core::types::*;
@@ -409,10 +409,11 @@ async fn index_repo(repo_cfg: &RepoConfig, api_key: &str) -> Result<()> {
     let producer = std::thread::spawn(move || -> Result<()> {
         let repo = git::open_repo(&repo_path)?;
         let chunker = chunk::tsv1_chunker()?;
+        let tc = TokenCounter::for_voyage()?;
 
         let mut batch_chunks: Vec<String> = Vec::new();
         let mut batch_locations: Vec<(usize, usize)> = Vec::new();
-        let mut batch_approx_tokens: usize = 0;
+        let mut batch_tokens: usize = 0;
 
         for &file_idx in &needs_work {
             let info = &file_infos_for_producer[file_idx];
@@ -436,20 +437,20 @@ async fn index_repo(repo_cfg: &RepoConfig, api_key: &str) -> Result<()> {
             for (chunk_idx, chunk) in chunks.iter().enumerate() {
                 let text =
                     String::from_utf8_lossy(chunk.content(&content)).into_owned();
-                let approx_tokens = text.len() / 4;
+                let chunk_tokens = tc.count(text.as_bytes());
 
                 // Flush if adding this chunk would exceed API limits.
                 if !batch_chunks.is_empty()
                     && (batch_chunks.len()
                         >= kb::embed::MAX_INPUTS_PER_REQUEST
-                        || batch_approx_tokens + approx_tokens
+                        || batch_tokens + chunk_tokens
                             > kb::embed::MAX_REQUEST_TOKENS)
                 {
                     let batch = EmbedBatch {
                         chunks: std::mem::take(&mut batch_chunks),
                         locations: std::mem::take(&mut batch_locations),
                     };
-                    batch_approx_tokens = 0;
+                    batch_tokens = 0;
                     if tx.blocking_send(batch).is_err() {
                         return Ok(()); // consumer dropped
                     }
@@ -457,7 +458,7 @@ async fn index_repo(repo_cfg: &RepoConfig, api_key: &str) -> Result<()> {
 
                 batch_chunks.push(text);
                 batch_locations.push((file_idx, chunk_idx));
-                batch_approx_tokens += approx_tokens;
+                batch_tokens += chunk_tokens;
             }
         }
 

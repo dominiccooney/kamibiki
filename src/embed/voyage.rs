@@ -5,6 +5,7 @@ use anyhow::{Result, ensure};
 use reqwest::Client;
 use tokio::time::{Duration, Instant};
 
+use crate::chunk::TokenCounter;
 use crate::core::types::{BinaryEmbedding, EMBEDDING_BYTES};
 use super::Embedder;
 
@@ -258,22 +259,28 @@ impl Embedder for VoyageEmbedder {
         let mut all_embeddings: Vec<BinaryEmbedding> = vec![[0u8; EMBEDDING_BYTES]; all_chunks.len()];
 
         // Batch chunks respecting API limits (max inputs per request
-        // and approximate token budget).
+        // and actual token budget via the model's tokenizer).
+        let tc = TokenCounter::for_voyage()?;
+        let chunk_token_counts: Vec<usize> = all_chunks
+            .iter()
+            .map(|c| tc.count(c.as_bytes()))
+            .collect();
+
         let mut batch_start = 0;
         while batch_start < all_chunks.len() {
             let mut batch_end = batch_start;
-            let mut approx_tokens = 0usize;
+            let mut batch_tokens = 0usize;
 
             while batch_end < all_chunks.len()
                 && batch_end - batch_start < MAX_INPUTS_PER_REQUEST
             {
-                let chunk_approx_tokens = all_chunks[batch_end].len() / 4;
-                if approx_tokens + chunk_approx_tokens > MAX_REQUEST_TOKENS
+                let chunk_tokens = chunk_token_counts[batch_end];
+                if batch_tokens + chunk_tokens > MAX_REQUEST_TOKENS
                     && batch_end > batch_start
                 {
                     break;
                 }
-                approx_tokens += chunk_approx_tokens;
+                batch_tokens += chunk_tokens;
                 batch_end += 1;
             }
 
