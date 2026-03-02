@@ -81,6 +81,12 @@ enum ChunkerKind {
 
 #[derive(Subcommand)]
 enum DebugCommands {
+    /// Count files and bytes at HEAD that pass the binary filter
+    Files {
+        /// Repository name (or '.' for current directory)
+        #[arg(default_value = ".")]
+        name: String,
+    },
     /// Run the chunker on files and display the resulting chunks
     Chunk {
         /// Files to chunk. If none are given, reads from stdin (requires --stdin-filename).
@@ -122,6 +128,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Commands::Debug { command } => match command {
+            DebugCommands::Files { name } => cmd_debug_files(&name),
             DebugCommands::Chunk {
                 files,
                 max_tokens,
@@ -864,6 +871,53 @@ fn cmd_drop(name: &str) -> Result<()> {
         format_bytes(total_size),
         repo_cfg.name,
     );
+
+    Ok(())
+}
+
+// ── kb debug files ───────────────────────────────────────────────
+
+fn cmd_debug_files(path: &str) -> Result<()> {
+    let repo_path = std::fs::canonicalize(path)
+        .with_context(|| format!("path does not exist: {}", path))?;
+    let repo = git::open_repo(&repo_path)?;
+    let commit_hex = git::head_commit_hex(&repo)?;
+    let entries = git::index_entries(&repo)?;
+
+    let mut file_count: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut skipped: u64 = 0;
+    let mut errors: u64 = 0;
+
+    for (_git_idx, path) in &entries {
+        let content = match git::read_blob_at_head(&repo, path) {
+            Ok(c) => c,
+            Err(_) => {
+                errors += 1;
+                continue;
+            }
+        };
+
+        // Simple filter: skip files with null bytes in first 8192 bytes.
+        if content.iter().take(8192).any(|&b| b == 0) {
+            skipped += 1;
+            continue;
+        }
+
+        file_count += 1;
+        total_bytes += content.len() as u64;
+    }
+
+    println!("HEAD: {}", &commit_hex[..commit_hex.len().min(12)]);
+    println!("Tracked files: {}", entries.len());
+    println!("Files passing filter: {}", file_count);
+    println!("Total bytes: {} ({})", total_bytes, format_bytes(total_bytes));
+    if skipped > 0 {
+        println!("Skipped (binary): {}", skipped);
+    }
+    if errors > 0 {
+        println!("Errors: {}", errors);
+    }
 
     Ok(())
 }
