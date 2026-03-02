@@ -4,12 +4,13 @@ use anyhow::Result;
 use crate::core::types::BinaryEmbedding;
 
 pub use voyage::VoyageEmbedder;
+pub use voyage::{MAX_INPUTS_PER_REQUEST, MAX_REQUEST_TOKENS};
 
 /// Trait for embedding text into binary quantized vectors.
 pub trait Embedder: Send + Sync {
     /// Embed a batch of document chunks. Each inner Vec<String> is the
-    /// set of chunks for one document (file), enabling contextual
-    /// embeddings.
+    /// set of chunks for one document (file). Chunks are embedded
+    /// individually via the standard text embedding endpoint.
     fn embed_documents(
         &self,
         documents: &[Vec<String>],

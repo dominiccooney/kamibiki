@@ -98,7 +98,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum IndexVersion {
-    /// tsv1 chunker + voyage-context-3@2048 binary quantized
+    /// tsv1 chunker + voyage-code-3@2048 binary quantized
     V1 = 1,
 }
 
@@ -121,7 +121,7 @@ pub struct IndexHeader {
     pub parent_hash: GitHash,
 }
 
-/// Binary quantized embedding for voyage-context-3@2048.
+/// Binary quantized embedding for voyage-code-3@2048.
 /// 2048 bits = 256 bytes.
 pub const EMBEDDING_BYTES: usize = 256;
 pub const EMBEDDING_ALIGNMENT: usize = 32; // AVX2-friendly
@@ -357,8 +357,8 @@ git worktree add ../kamibiki-cli     cli
 **Tasks:**
 1. Implement `LinesChunker` — the fallback chunker that splits on
    newlines and merges adjacent lines until reaching a target chunk
-   size (measured in bytes; target ~1500 bytes for voyage-context-3
-   which has a 4K token context but we want smaller chunks).
+   size (measured in bytes; target ~1500 bytes for voyage-code-3
+   which has a 32K token context but we want smaller chunks).
 2. Implement `TreeSitterChunker` — uses tree-sitter to parse files in
    supported languages, recursively walks the parse tree, and produces
    chunks by collecting sibling nodes until reaching the target size.
@@ -418,8 +418,8 @@ quantization.
 **Files:** `src/embed/mod.rs`, `src/embed/voyage.rs`
 
 **Tasks:**
-1. Implement `VoyageEmbedder` that calls the Voyage AI contextual
-   embeddings API (`voyage-context-3` model, 2048 output dimensions).
+1. Implement `VoyageEmbedder` that calls the Voyage AI text
+   embeddings API (`voyage-code-3` model, 2048 output dimensions).
 2. Implement binary quantization: threshold at 0 (positive → 1,
    negative/zero → 0), pack into `[u8; 256]`.
 3. Implement query embedding (input_type = "query").
@@ -430,9 +430,10 @@ quantization.
 6. Integration tests (require `VOYAGE_API_KEY` env var, skip if absent).
 
 **Key design decisions:**
-- Binary quantization reduces 2048 f32 → 256 bytes (32x compression).
-- We use the contextual embeddings API which takes document chunks with
-  context. Each chunk is embedded in the context of its containing file.
+- Binary quantization reduces 2048 f32 → 256 bytes (32× compression).
+- We use the standard text embeddings API. Each chunk is embedded
+  individually. Future work may add contextual decoration of chunks
+  before embedding.
 - The API key is stored in `~/.kb.conf`.
 
 ### Workstream D: Search + Rerank (`search` branch)

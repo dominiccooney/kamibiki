@@ -144,6 +144,10 @@ fn boundary_score(content: &[u8], prev_end: usize, next_start: usize) -> u32 {
 /// by blank lines, greedily merge children preferring breaks at
 /// high-score boundaries, and recurse into any single child that
 /// still exceeds max_tokens.
+///
+/// Uses prefix sums over per-child token counts for O(1) group size
+/// estimates, avoiding the O(N²) cost of re-tokenizing growing
+/// groups on every iteration.
 fn chunk_node(
     node: Node,
     content: &[u8],
@@ -182,6 +186,22 @@ fn chunk_node(
             .collect();
     }
 
+    // Precompute per-child token counts (one tc.count per child).
+    let child_tokens: Vec<usize> = children
+        .iter()
+        .map(|c| tc.count(&content[c.start_byte()..c.end_byte()]))
+        .collect();
+
+    // Prefix sum for O(1) range queries: prefix[i+1] - prefix[j]
+    // gives the approximate token count for children[j..=i].
+    let prefix: Vec<usize> = {
+        let mut p = vec![0usize; children.len() + 1];
+        for i in 0..children.len() {
+            p[i + 1] = p[i] + child_tokens[i];
+        }
+        p
+    };
+
     // Score boundaries between adjacent children.
     let mut boundary_scores: Vec<u32> = vec![0]; // index 0 unused
     for i in 1..children.len() {
@@ -201,10 +221,8 @@ fn chunk_node(
     let mut best_break_score: u32 = 0;
 
     for i in 1..children.len() {
-        let group_start_byte = children[group_start_idx].start_byte();
-        let prospective_end = children[i].end_byte();
-        let prospective_tokens =
-            tc.count(&content[group_start_byte..prospective_end]);
+        // O(1) token estimate via prefix sum instead of re-tokenizing.
+        let prospective_tokens = prefix[i + 1] - prefix[group_start_idx];
 
         let score = boundary_scores[i];
 
@@ -222,6 +240,7 @@ fn chunk_node(
                 content,
                 max_tokens,
                 tc,
+                &child_tokens,
                 &mut result,
             );
 
@@ -253,6 +272,7 @@ fn chunk_node(
         content,
         max_tokens,
         tc,
+        &child_tokens,
         &mut result,
     );
 
@@ -260,6 +280,11 @@ fn chunk_node(
 }
 
 /// Emit a group of children [start_idx..end_idx) as chunk ranges.
+///
+/// Uses precomputed `child_tokens` to avoid redundant tokenizer
+/// calls. Falls back to `tc.count()` only when recursing into
+/// oversized single children (which recomputes their own prefix
+/// sums at a lower level).
 fn emit_group(
     children: &[Node],
     start_idx: usize,
@@ -267,6 +292,7 @@ fn emit_group(
     content: &[u8],
     max_tokens: usize,
     tc: &TokenCounter,
+    child_tokens: &[usize],
     result: &mut Vec<Range>,
 ) {
     if start_idx >= end_idx {
@@ -275,7 +301,7 @@ fn emit_group(
 
     let group_start = children[start_idx].start_byte();
     let group_end = children[end_idx - 1].end_byte();
-    let group_tokens = tc.count(&content[group_start..group_end]);
+    let group_tokens: usize = child_tokens[start_idx..end_idx].iter().sum();
 
     if group_tokens <= max_tokens {
         result.push(Range {
@@ -288,27 +314,30 @@ fn emit_group(
         result.extend(sub);
     } else {
         // Multiple children that together exceed max_tokens.
-        // Try each child individually.
+        // Try each child individually, merging small neighbors.
+        let group_result_start = result.len();
+        let mut running_tokens: usize = 0;
+
         for idx in start_idx..end_idx {
-            let child_tokens = tc.count(
-                &content[children[idx].start_byte()..children[idx].end_byte()],
-            );
-            if child_tokens <= max_tokens {
-                if let Some(last) = result.last_mut() {
-                    let merged_tokens =
-                        tc.count(&content[last.start..children[idx].end_byte()]);
-                    if merged_tokens <= max_tokens {
-                        last.end = children[idx].end_byte();
-                        continue;
-                    }
+            let ct = child_tokens[idx];
+            if ct <= max_tokens {
+                // Try to merge with the previous range from this group.
+                if result.len() > group_result_start
+                    && running_tokens + ct <= max_tokens
+                {
+                    result.last_mut().unwrap().end = children[idx].end_byte();
+                    running_tokens += ct;
+                    continue;
                 }
                 result.push(Range {
                     start: children[idx].start_byte(),
                     end: children[idx].end_byte(),
                 });
+                running_tokens = ct;
             } else {
                 let sub = chunk_node(children[idx], content, max_tokens, tc);
                 result.extend(sub);
+                running_tokens = 0;
             }
         }
     }

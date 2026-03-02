@@ -45,7 +45,7 @@ impl TokenCounter {
     /// HuggingFace Hub (cached locally after first download).
     pub fn for_voyage() -> Result<Self> {
         let tokenizer =
-            tokenizers::Tokenizer::from_pretrained("voyageai/voyage-context-3", None)
+            tokenizers::Tokenizer::from_pretrained("voyageai/voyage-code-3", None)
                 .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {}", e))?;
         Ok(TokenCounter {
             tokenizer: Arc::new(tokenizer),
@@ -72,4 +72,12 @@ impl TokenCounter {
 pub fn tsv1_chunker() -> Result<impl Chunker> {
     let tc = TokenCounter::for_voyage()?;
     Ok(treesitter::TreeSitterChunker::new(tc))
+}
+
+/// A lines-only chunker (indent-heuristic, no tree-sitter). Useful
+/// for benchmarking and as a fast alternative when AST accuracy is
+/// not needed.
+pub fn lines_chunker() -> Result<impl Chunker> {
+    let tc = TokenCounter::for_voyage()?;
+    Ok(lines::LinesChunker { token_counter: tc })
 }

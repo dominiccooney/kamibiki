@@ -280,6 +280,92 @@ pub fn write_embeddings_at(
     Ok(())
 }
 
+/// Write embeddings at arbitrary (file, chunk) positions in a
+/// pre-allocated index file. Used for cross-file batch writes
+/// where a single API batch may contain chunks from multiple files.
+pub fn write_embeddings_scattered(
+    path: &Path,
+    layout: &IndexLayout,
+    locations: &[(usize, usize)], // (file_idx, chunk_idx_within_file)
+    embeddings: &[BinaryEmbedding],
+) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    debug_assert_eq!(locations.len(), embeddings.len());
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    for (i, &(file_idx, chunk_idx)) in locations.iter().enumerate() {
+        let offset = layout.embeddings_offset
+            + (layout.chunk_prefix[file_idx] + chunk_idx) * EMBEDDING_BYTES;
+        file.seek(SeekFrom::Start(offset as u64))?;
+        file.write_all(&embeddings[i])?;
+    }
+    Ok(())
+}
+
+/// Reconstruct `FileChunkInfo` entries from an existing index
+/// file's metadata, using git index entries to resolve file paths.
+/// This avoids re-chunking the entire repository when resuming
+/// an incomplete index.
+pub fn read_file_infos(
+    data: &[u8],
+    git_entries: &[(usize, String)],
+) -> Result<Vec<FileChunkInfo>> {
+    ensure!(data.len() >= HEADER_SIZE, "index file too small");
+
+    let (positions, ot_bytes) = decode_offset_table(&data[HEADER_SIZE..])?;
+    let num_files = positions.len();
+    let mut pos = HEADER_SIZE + ot_bytes;
+
+    // Build position → path lookup.
+    let pos_to_path: std::collections::HashMap<usize, &str> =
+        git_entries.iter().map(|(i, p)| (*i, p.as_str())).collect();
+
+    // Read chunk counts.
+    ensure!(
+        pos + num_files * 2 <= data.len(),
+        "index truncated at chunk count table"
+    );
+    let mut chunk_counts = Vec::with_capacity(num_files);
+    for i in 0..num_files {
+        let off = pos + i * 2;
+        chunk_counts.push(u16::from_le_bytes([data[off], data[off + 1]]) as usize);
+    }
+    pos += num_files * 2;
+
+    // Read chunk lengths per file and build FileChunkInfo.
+    let mut file_infos = Vec::with_capacity(num_files);
+    for i in 0..num_files {
+        let count = chunk_counts[i];
+        ensure!(
+            pos + count * 2 <= data.len(),
+            "index truncated at length table for file {}",
+            i
+        );
+        let mut lengths = Vec::with_capacity(count);
+        for j in 0..count {
+            let off = pos + j * 2;
+            lengths.push(u16::from_le_bytes([data[off], data[off + 1]]));
+        }
+        pos += count * 2;
+
+        let path = pos_to_path
+            .get(&positions[i])
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "git index position {} not found in current git index",
+                    positions[i]
+                )
+            })?;
+
+        file_infos.push(FileChunkInfo {
+            git_index_position: positions[i],
+            path: path.to_string(),
+            chunk_lengths: lengths,
+        });
+    }
+
+    Ok(file_infos)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

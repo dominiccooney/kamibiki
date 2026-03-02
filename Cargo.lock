@@ -2122,6 +2122,7 @@ dependencies = [
  "indicatif 0.17.11",
  "memmap2",
  "ordered-float",
+ "rayon",
  "reqwest",
  "serde",
  "serde_json",

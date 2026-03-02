@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum IndexVersion {
-    /// tsv1 chunker + voyage-context-3@2048 binary quantized
+    /// tsv1 chunker + voyage-code-3@2048 binary quantized
     V1 = 1,
 }
 
@@ -28,7 +28,7 @@ pub struct IndexHeader {
     pub parent_hash: GitHash,
 }
 
-/// Binary quantized embedding for voyage-context-3@2048.
+/// Binary quantized embedding for voyage-code-3@2048.
 /// 2048 bits = 256 bytes.
 pub const EMBEDDING_BYTES: usize = 256;
 pub const EMBEDDING_ALIGNMENT: usize = 32; // AVX2-friendly

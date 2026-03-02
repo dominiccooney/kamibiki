@@ -61,5 +61,5 @@ impl FileChunkInfo {
 }
 
 // Re-exports for convenience.
-pub use format::{write_index, write_skeleton, index_layout, detect_incomplete, write_embeddings_at, IndexLayout};
+pub use format::{write_index, write_skeleton, index_layout, detect_incomplete, write_embeddings_at, write_embeddings_scattered, read_file_infos, IndexLayout};
 pub use mmap::MmapIndexReader;

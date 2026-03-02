@@ -1,25 +1,103 @@
+use std::collections::VecDeque;
+use std::sync::Mutex;
+
 use anyhow::{Result, ensure};
 use reqwest::Client;
+use tokio::time::{Duration, Instant};
 
 use crate::core::types::{BinaryEmbedding, EMBEDDING_BYTES};
 use super::Embedder;
 
-/// Voyage AI embedding client using voyage-context-3 with binary
+// ── Token rate limiter ───────────────────────────────────────────
+
+/// Maximum tokens per minute we'll send to Voyage.
+/// The actual API limit is 3,000,000; we use 2,800,000 for safety.
+const TOKEN_RATE_LIMIT: usize = 2_800_000;
+
+/// The sliding window duration for rate limiting.
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Tracks token consumption in a sliding window and sleeps when
+/// the budget would be exceeded.
+struct TokenRateLimiter {
+    inner: Mutex<RateLimiterInner>,
+}
+
+struct RateLimiterInner {
+    window: VecDeque<(Instant, usize)>,
+    limit: usize,
+}
+
+impl RateLimiterInner {
+    /// Remove entries older than the rate-limit window.
+    fn prune(&mut self, now: Instant) {
+        while let Some(&(ts, _)) = self.window.front() {
+            if now.duration_since(ts) >= RATE_LIMIT_WINDOW {
+                self.window.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+impl TokenRateLimiter {
+    fn new(tokens_per_minute: usize) -> Self {
+        Self {
+            inner: Mutex::new(RateLimiterInner {
+                window: VecDeque::new(),
+                limit: tokens_per_minute,
+            }),
+        }
+    }
+
+    /// Wait until `tokens` can be consumed without exceeding the
+    /// per-minute limit, then record the consumption.
+    async fn acquire(&self, tokens: usize) {
+        loop {
+            let sleep_duration = {
+                let mut inner = self.inner.lock().unwrap();
+                let now = Instant::now();
+                inner.prune(now);
+                let current: usize =
+                    inner.window.iter().map(|(_, t)| *t).sum();
+
+                if current + tokens <= inner.limit {
+                    inner.window.push_back((now, tokens));
+                    return;
+                }
+
+                // Figure out how long to sleep: walk entries oldest-first
+                // until freeing enough budget.
+                let mut to_free = (current + tokens).saturating_sub(inner.limit);
+                let mut wait_until = now;
+                for &(ts, count) in &inner.window {
+                    wait_until = ts + RATE_LIMIT_WINDOW;
+                    if count >= to_free {
+                        break;
+                    }
+                    to_free -= count;
+                }
+
+                wait_until.duration_since(now)
+            };
+
+            tokio::time::sleep(sleep_duration).await;
+        }
+    }
+}
+
+// ── Voyage embedder ──────────────────────────────────────────────
+
+/// Voyage AI embedding client using voyage-code-3 with binary
 /// quantization.
 pub struct VoyageEmbedder {
     api_key: String,
     client: Client,
+    rate_limiter: TokenRateLimiter,
 }
 
-// --- Request types ---
-
-#[derive(serde::Serialize)]
-struct ContextualEmbeddingRequest<'a> {
-    inputs: &'a [Vec<String>],
-    model: &'a str,
-    input_type: &'a str,
-    output_dimension: usize,
-}
+// --- Request / Response types ---
 
 #[derive(serde::Serialize)]
 struct TextEmbeddingRequest<'a> {
@@ -29,23 +107,10 @@ struct TextEmbeddingRequest<'a> {
     output_dimension: usize,
 }
 
-// --- Response types ---
-
-#[derive(serde::Deserialize)]
-struct ContextualEmbeddingResponse {
-    data: Vec<ContextualDocumentData>,
-    usage: Usage,
-}
-
-#[derive(serde::Deserialize)]
-struct ContextualDocumentData {
-    data: Vec<EmbeddingData>,
-    index: usize,
-}
-
 #[derive(serde::Deserialize)]
 struct TextEmbeddingResponse {
     data: Vec<EmbeddingData>,
+    #[allow(dead_code)]
     usage: Usage,
 }
 
@@ -56,6 +121,7 @@ struct EmbeddingData {
 }
 
 #[derive(serde::Deserialize)]
+#[allow(dead_code)]
 struct Usage {
     total_tokens: usize,
 }
@@ -64,69 +130,38 @@ struct Usage {
 /// binary quantize → 256 bytes.
 const OUTPUT_DIMENSION: usize = 2048;
 
-/// Maximum tokens per API request (Voyage's limit is 120K, we use
-/// 110K for safety margin).
-const MAX_REQUEST_TOKENS: usize = 110_000;
+/// Maximum tokens per API request (Voyage's limit is 120K for
+/// voyage-code-3, we use 110K for safety margin).
+pub const MAX_REQUEST_TOKENS: usize = 110_000;
 
-/// Maximum number of documents per contextual embedding request.
-/// Voyage's limit.
-const MAX_DOCUMENTS_PER_REQUEST: usize = 16;
+/// Maximum number of text inputs per embedding request. Voyage's
+/// limit is 1000; we use a smaller batch to keep requests
+/// manageable.
+pub const MAX_INPUTS_PER_REQUEST: usize = 128;
 
 impl VoyageEmbedder {
     pub fn new(api_key: String) -> Self {
         VoyageEmbedder {
             api_key,
             client: Client::new(),
+            rate_limiter: TokenRateLimiter::new(TOKEN_RATE_LIMIT),
         }
     }
 
-    /// Make a contextual embedding API call for a single batch.
-    async fn call_contextual(
-        &self,
-        input_type: &str,
-        inputs: &[Vec<String>],
-    ) -> Result<ContextualEmbeddingResponse> {
-        let body = ContextualEmbeddingRequest {
-            inputs,
-            model: "voyage-context-3",
-            input_type,
-            output_dimension: OUTPUT_DIMENSION,
-        };
-        let response = self
-            .client
-            .post("https://api.voyageai.com/v1/contextualizedembeddings")
-            .header("authorization", format!("Bearer {}", self.api_key))
-            .json(&body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Voyage contextual embedding failed: HTTP {}\n{}",
-                status,
-                text
-            );
-        }
-
-        let resp: ContextualEmbeddingResponse = response.json().await?;
-        eprintln!(
-            "info: contextual embedding used {} tokens",
-            resp.usage.total_tokens
-        );
-        Ok(resp)
-    }
-
-    /// Make a text embedding API call.
+    /// Make a text embedding API call. Automatically waits for
+    /// rate-limit budget before sending.
     async fn call_text_embedding(
         &self,
         input_type: &str,
         input: &[String],
     ) -> Result<TextEmbeddingResponse> {
+        // Estimate tokens (chars / 4) and acquire rate-limit budget.
+        let approx_tokens: usize = input.iter().map(|s| s.len() / 4).sum::<usize>().max(1);
+        self.rate_limiter.acquire(approx_tokens).await;
+
         let body = TextEmbeddingRequest {
             input,
-            model: "voyage-context-3",
+            model: "voyage-code-3",
             input_type,
             output_dimension: OUTPUT_DIMENSION,
         };
@@ -149,11 +184,31 @@ impl VoyageEmbedder {
         }
 
         let resp: TextEmbeddingResponse = response.json().await?;
-        eprintln!(
-            "info: text embedding used {} tokens",
-            resp.usage.total_tokens
-        );
         Ok(resp)
+    }
+
+    /// Embed a flat batch of text chunks in a single API call.
+    /// The caller must ensure the batch fits within API limits
+    /// (`MAX_INPUTS_PER_REQUEST` items, ~`MAX_REQUEST_TOKENS` tokens).
+    pub async fn embed_batch(&self, chunks: &[String]) -> Result<Vec<BinaryEmbedding>> {
+        ensure!(!chunks.is_empty(), "empty batch");
+        let resp = self.call_text_embedding("document", chunks).await?;
+        ensure!(
+            resp.data.len() == chunks.len(),
+            "expected {} embeddings, got {}",
+            chunks.len(),
+            resp.data.len()
+        );
+        let mut embeddings = vec![[0u8; EMBEDDING_BYTES]; chunks.len()];
+        for ed in &resp.data {
+            ensure!(
+                ed.index < chunks.len(),
+                "embedding index {} out of bounds",
+                ed.index
+            );
+            embeddings[ed.index] = binary_quantize(&ed.embedding)?;
+        }
+        Ok(embeddings)
     }
 }
 
@@ -185,59 +240,69 @@ impl Embedder for VoyageEmbedder {
             return Ok(Vec::new());
         }
 
-        // Batch documents respecting API limits. We batch by
-        // document count (max 16 per request) and do approximate
-        // token counting by character length / 4.
-        let mut all_results: Vec<Vec<BinaryEmbedding>> = vec![Vec::new(); documents.len()];
+        // Flatten all chunks from all documents into a single list,
+        // tracking which document each chunk belongs to.
+        let mut all_chunks: Vec<String> = Vec::new();
+        let mut chunk_doc_map: Vec<usize> = Vec::new(); // chunk index → document index
+        let mut doc_chunk_counts: Vec<usize> = Vec::new();
 
+        for (doc_idx, doc_chunks) in documents.iter().enumerate() {
+            doc_chunk_counts.push(doc_chunks.len());
+            for chunk in doc_chunks {
+                chunk_doc_map.push(doc_idx);
+                all_chunks.push(chunk.clone());
+            }
+        }
+
+        // Allocate result storage.
+        let mut all_embeddings: Vec<BinaryEmbedding> = vec![[0u8; EMBEDDING_BYTES]; all_chunks.len()];
+
+        // Batch chunks respecting API limits (max inputs per request
+        // and approximate token budget).
         let mut batch_start = 0;
-        while batch_start < documents.len() {
+        while batch_start < all_chunks.len() {
             let mut batch_end = batch_start;
             let mut approx_tokens = 0usize;
 
-            while batch_end < documents.len()
-                && batch_end - batch_start < MAX_DOCUMENTS_PER_REQUEST
+            while batch_end < all_chunks.len()
+                && batch_end - batch_start < MAX_INPUTS_PER_REQUEST
             {
-                let doc_chars: usize = documents[batch_end]
-                    .iter()
-                    .map(|s| s.len())
-                    .sum();
-                let doc_approx_tokens = doc_chars / 4;
-                if approx_tokens + doc_approx_tokens > MAX_REQUEST_TOKENS
+                let chunk_approx_tokens = all_chunks[batch_end].len() / 4;
+                if approx_tokens + chunk_approx_tokens > MAX_REQUEST_TOKENS
                     && batch_end > batch_start
                 {
                     break;
                 }
-                approx_tokens += doc_approx_tokens;
+                approx_tokens += chunk_approx_tokens;
                 batch_end += 1;
             }
 
-            // Ensure progress even if a single document is huge.
+            // Ensure progress even if a single chunk is huge.
             if batch_end == batch_start {
                 batch_end = batch_start + 1;
             }
 
-            let batch = &documents[batch_start..batch_end];
-            let resp = self.call_contextual("document", batch).await?;
+            let batch = &all_chunks[batch_start..batch_end];
+            let resp = self.call_text_embedding("document", batch).await?;
 
-            // Parse response: data is ordered by document index,
-            // each containing chunk embeddings.
-            for doc_data in resp.data {
-                let doc_idx = batch_start + doc_data.index;
-                let mut chunk_embeddings: Vec<(usize, BinaryEmbedding)> = doc_data
-                    .data
-                    .iter()
-                    .map(|ed| Ok((ed.index, binary_quantize(&ed.embedding)?)))
-                    .collect::<Result<Vec<_>>>()?;
-                chunk_embeddings.sort_by_key(|(idx, _)| *idx);
-                all_results[doc_idx] =
-                    chunk_embeddings.into_iter().map(|(_, e)| e).collect();
+            // Place embeddings at the correct flat indices.
+            for ed in &resp.data {
+                let flat_idx = batch_start + ed.index;
+                all_embeddings[flat_idx] = binary_quantize(&ed.embedding)?;
             }
 
             batch_start = batch_end;
         }
 
-        Ok(all_results)
+        // Reassemble flat embeddings into per-document vectors.
+        let mut results: Vec<Vec<BinaryEmbedding>> = Vec::with_capacity(documents.len());
+        let mut offset = 0;
+        for &count in &doc_chunk_counts {
+            results.push(all_embeddings[offset..offset + count].to_vec());
+            offset += count;
+        }
+
+        Ok(results)
     }
 
     async fn embed_query(&self, query: &str) -> Result<BinaryEmbedding> {
