@@ -36,8 +36,42 @@ also stores pointers to all of your indexed repositories in
 
 ## MCP server
 
-Kamibiki server is also an MCP server. The MCP server supports similar
-commands as above.
+`kb start` launches Kamibiki as an MCP server over stdio (JSON-RPC
+2.0, newline-delimited). It exposes two tools:
+
+**kb_search** — Search an indexed repository for code relevant to a
+query. Parameters:
+- `name` (required): repository name, or `.` for the current repo
+- `query` (required): natural language or code search query
+- `top` (optional): number of results, default 10
+
+**kb_status** — Show indexing status of registered repositories.
+Parameters:
+- `name` (optional): specific repository name; omit for all repos
+
+### Connecting a coding agent
+
+Add kamibiki to your MCP server configuration. For example, in Cline
+(VS Code or CLI), edit your MCP settings:
+
+```json
+{
+  "mcpServers": {
+    "kamibiki": {
+      "command": "kb",
+      "args": ["start"],
+      "disabled": false
+    }
+  }
+}
+```
+
+For Cline VS Code, this file is at
+`~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`.
+For Cline CLI, it's at `~/.config/cline-cli/cline_mcp_settings.json`.
+
+Once configured, your coding agent will see `kb_search` and
+`kb_status` as available tools.
 
 ## Technical Background
 

@@ -41,7 +41,7 @@ enum Commands {
     Status {
         name: Option<String>,
     },
-    /// Start the server (not yet implemented)
+    /// Start the MCP server on stdio
     Start,
     /// Stop the server (not yet implemented)
     Stop,
@@ -116,10 +116,7 @@ fn main() -> Result<()> {
         }
         Commands::Alias { name, repos } => cmd_alias(&name, &repos),
         Commands::Drop { name } => cmd_drop(&name),
-        Commands::Start => {
-            eprintln!("Server mode not yet implemented.");
-            Ok(())
-        }
+        Commands::Start => kb::server::run_mcp_server(),
         Commands::Stop => {
             eprintln!("Server mode not yet implemented.");
             Ok(())
