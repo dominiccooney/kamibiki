@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -244,10 +245,8 @@ fn cmd_status(name: Option<&str>) -> Result<()> {
             println!("  Total index size: {}", format_bytes(total_size));
 
             if let Ok(reader) = MmapIndexReader::open(&kbi_files[0].path()) {
-                let commit_hex = hex::encode(
-                    &reader.header().commit_hash,
-                );
-                let short = &commit_hex[..commit_hex.find(|c| c == '0').unwrap_or(commit_hex.len()).max(8).min(commit_hex.len())];
+                let commit_hex = commit_hash_to_hex(&reader.header().commit_hash);
+                let short = &commit_hex[..commit_hex.len().min(12)];
                 println!("  Latest indexed commit: {}", short);
                 println!("  Files in latest index: {}", reader.file_count());
                 println!("  Embeddings in latest index: {}", reader.embedding_count());
@@ -347,7 +346,80 @@ async fn index_repo(repo_cfg: &RepoConfig, api_key: &str) -> Result<()> {
         );
         infos
     } else {
-        let infos = chunk_all_files(&repo_cfg.path, &entries)?;
+        // Try delta mode: find an existing parent index to build on.
+        let parent_info = find_parent_index_info(&kb_dir, &index_path);
+
+        let (infos, parent_hash) = if let Some((_, ref parent_commit_hex)) = parent_info {
+            // Delta mode: only chunk files that changed since the parent.
+            let diff = git::changed_files_between(
+                &repo, parent_commit_hex, &commit_hex,
+            )?;
+            let total_changes = diff.changed.len() + diff.deleted.len();
+            eprintln!(
+                "  Delta from {}: {} files added/modified, {} deleted",
+                &parent_commit_hex[..parent_commit_hex.len().min(12)],
+                diff.changed.len(),
+                diff.deleted.len(),
+            );
+
+            if total_changes == 0 {
+                eprintln!("  No files changed. Index is up to date.");
+                return Ok(());
+            }
+
+            // Chunk added/modified files (those present at HEAD).
+            let changed_set: HashSet<&str> = diff.changed.iter().map(|s| s.as_str()).collect();
+            let changed_entries: Vec<(usize, String)> = entries.iter()
+                .filter(|(_, path)| changed_set.contains(path.as_str()))
+                .cloned()
+                .collect();
+
+            let mut infos = chunk_all_files(&repo_cfg.path, &changed_entries)?;
+
+            // Any changed file that didn't produce chunks (binary,
+            // empty, unreadable) also needs a tombstone to suppress
+            // stale parent results. Otherwise the parent's old
+            // version would still be served.
+            let chunked_paths: HashSet<&str> = infos.iter()
+                .map(|info| info.path.as_str())
+                .collect();
+            let mut unchunked_changed: Vec<&str> = changed_entries.iter()
+                .map(|(_, p)| p.as_str())
+                .filter(|p| !chunked_paths.contains(p))
+                .collect();
+
+            // Combine with explicitly deleted files.
+            let mut tombstone_paths: Vec<String> = diff.deleted;
+            tombstone_paths.extend(
+                unchunked_changed.drain(..).map(|s| s.to_string())
+            );
+
+            // Add tombstone entries (0 chunks) so the delta signals
+            // to suppress stale parent results. Assign synthetic
+            // git_index_positions beyond the real index range.
+            let max_real_pos = entries.iter().map(|(i, _)| *i).max().unwrap_or(0);
+            for (i, path) in tombstone_paths.iter().enumerate() {
+                infos.push(FileChunkInfo {
+                    git_index_position: max_real_pos + 1 + i,
+                    path: path.clone(),
+                    chunk_lengths: vec![], // tombstone: 0 chunks
+                });
+            }
+
+            // Re-sort by git_index_position for the offset table.
+            infos.sort_by_key(|info| info.git_index_position);
+
+            let mut ph: GitHash = [0; MAX_HASH_LEN];
+            let ph_bytes = parent_commit_hex.as_bytes();
+            ph[..ph_bytes.len().min(MAX_HASH_LEN)]
+                .copy_from_slice(&ph_bytes[..ph_bytes.len().min(MAX_HASH_LEN)]);
+
+            (infos, ph)
+        } else {
+            // Full mode: no parent index exists.
+            let infos = chunk_all_files(&repo_cfg.path, &entries)?;
+            (infos, [0u8; MAX_HASH_LEN])
+        };
 
         let mut commit_hash: GitHash = [0; MAX_HASH_LEN];
         let hex_bytes = commit_hex.as_bytes();
@@ -357,17 +429,38 @@ async fn index_repo(repo_cfg: &RepoConfig, api_key: &str) -> Result<()> {
         let header = IndexHeader {
             version: 1,
             commit_hash,
-            parent_hash: [0; MAX_HASH_LEN],
+            parent_hash,
         };
 
         index::write_skeleton(&index_path, &header, &infos)?;
+
+        // Pre-fill reusable embeddings from the parent index. For
+        // each changed file, chunks whose text is identical between
+        // old and new versions can reuse the old embedding.
+        if let Some((ref parent_path, ref parent_commit_hex)) = parent_info {
+            let reused = prefill_reusable_embeddings(
+                &repo, &index_path, &infos, parent_path, parent_commit_hex,
+            )?;
+            if reused > 0 {
+                eprintln!("  Reused {} embeddings from parent index", reused);
+            }
+        }
+
         eprintln!("  Pre-allocated index: {}", index_path.display());
         infos
     };
 
     let total_chunks: usize = file_infos.iter().map(|f| f.chunk_count()).sum();
     if total_chunks == 0 {
-        eprintln!("  No chunks to index.");
+        let tombstones = file_infos.iter().filter(|f| f.chunk_lengths.is_empty()).count();
+        if tombstones > 0 {
+            eprintln!(
+                "  Delta index written ({} tombstones, no embeddings needed).",
+                tombstones,
+            );
+        } else {
+            eprintln!("  No chunks to index.");
+        }
         return Ok(());
     }
 
@@ -376,6 +469,26 @@ async fn index_repo(repo_cfg: &RepoConfig, api_key: &str) -> Result<()> {
     let data = std::fs::read(&index_path)?;
     let layout = Arc::new(index::index_layout(&data)?);
     let needs_work = index::detect_incomplete(&data, &layout);
+
+    // Find chunks within incomplete files that already have embeddings
+    // (e.g. reused from a parent index during delta indexing, or from
+    // a partially completed previous run). The producer will skip these.
+    let skip_chunks: HashSet<(usize, usize)> = {
+        let mut skips = HashSet::new();
+        for &fi in &needs_work {
+            let start = layout.chunk_prefix[fi];
+            let end = layout.chunk_prefix[fi + 1];
+            for ci in 0..(end - start) {
+                let off = layout.embeddings_offset + (start + ci) * EMBEDDING_BYTES;
+                if off + EMBEDDING_BYTES <= data.len()
+                    && !data[off..off + EMBEDDING_BYTES].iter().all(|&b| b == 0)
+                {
+                    skips.insert((fi, ci));
+                }
+            }
+        }
+        skips
+    };
     drop(data);
 
     if needs_work.is_empty() {
@@ -391,7 +504,7 @@ async fn index_repo(repo_cfg: &RepoConfig, api_key: &str) -> Result<()> {
         .iter()
         .map(|&i| file_infos[i].chunk_count())
         .sum();
-    let already_done_chunks = total_chunks - incomplete_chunks;
+    let already_done_chunks = total_chunks - incomplete_chunks + skip_chunks.len();
 
     // ── Pipeline: produce cross-file batches, embed concurrently ──
     //
@@ -409,6 +522,8 @@ async fn index_repo(repo_cfg: &RepoConfig, api_key: &str) -> Result<()> {
     let file_infos = Arc::new(file_infos);
     let file_infos_for_producer = Arc::clone(&file_infos);
     let repo_path = repo_cfg.path.to_path_buf();
+    let skip_chunks = Arc::new(skip_chunks);
+    let skip_chunks_for_producer = Arc::clone(&skip_chunks);
 
     let producer = std::thread::spawn(move || -> Result<()> {
         let repo = git::open_repo(&repo_path)?;
@@ -439,6 +554,12 @@ async fn index_repo(repo_cfg: &RepoConfig, api_key: &str) -> Result<()> {
             };
 
             for (chunk_idx, chunk) in chunks.iter().enumerate() {
+                // Skip chunks that already have embeddings (reused
+                // from parent index or from a previous partial run).
+                if skip_chunks_for_producer.contains(&(file_idx, chunk_idx)) {
+                    continue;
+                }
+
                 let text =
                     String::from_utf8_lossy(chunk.content(&content)).into_owned();
                 let chunk_tokens = tc.count(text.as_bytes());
@@ -735,7 +856,10 @@ async fn cmd_search(name: &str, query: &str, top: usize) -> Result<()> {
         return Ok(());
     }
 
-    let entries = git::index_entries(&repo)?;
+    // Resolve file positions → paths and read content from the
+    // commit that was actually indexed, not the current HEAD.
+    let indexed_commit = commit_hash_to_hex(&reader.header().commit_hash);
+    let entries = git::entries_at_commit(&repo, &indexed_commit)?;
 
     let mut chunk_contents: Vec<String> = Vec::new();
     let mut chunk_paths: Vec<String> = Vec::new();
@@ -749,7 +873,7 @@ async fn cmd_search(name: &str, query: &str, top: usize) -> Result<()> {
             .map(|(_, p)| p.as_str())
             .unwrap_or("<unknown>");
 
-        let content = git::read_blob_at_head(&repo, path).unwrap_or_default();
+        let content = git::read_blob(&repo, &indexed_commit, path).unwrap_or_default();
 
         let offset = result.chunk_ref.byte_offset as usize;
         let len = result.chunk_ref.chunk_len as usize;
@@ -1093,8 +1217,158 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-mod hex {
-    pub fn encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{:02x}", b)).collect()
-    }
+// ── Delta indexing helpers ────────────────────────────────────────
+
+/// Extract the commit hash hex string from a GitHash (stored as ASCII
+/// hex bytes padded with zeroes).
+fn commit_hash_to_hex(hash: &GitHash) -> String {
+    let end = hash.iter().position(|&b| b == 0).unwrap_or(hash.len());
+    String::from_utf8_lossy(&hash[..end]).into_owned()
 }
+
+/// Find the most recent existing index file to use as a parent for
+/// delta indexing. Returns `(path, commit_hex)` of the parent index,
+/// or `None` if no suitable parent exists.
+fn find_parent_index_info(kb_dir: &Path, exclude_path: &Path) -> Option<(PathBuf, String)> {
+    let mut kbi_files: Vec<_> = std::fs::read_dir(kb_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let p = e.path();
+            p.extension().is_some_and(|ext| ext == "kbi") && p != exclude_path
+        })
+        .collect();
+
+    if kbi_files.is_empty() {
+        return None;
+    }
+
+    // Most recent first.
+    kbi_files.sort_by_key(|e| {
+        std::cmp::Reverse(
+            e.metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        )
+    });
+
+    let path = kbi_files[0].path();
+    let reader = MmapIndexReader::open(&path).ok()?;
+    let commit_hex = commit_hash_to_hex(&reader.header().commit_hash);
+
+    if commit_hex.is_empty() {
+        return None;
+    }
+
+    Some((path, commit_hex))
+}
+
+/// Pre-fill reusable embeddings from a parent index into a newly
+/// written skeleton. For each file in the new delta index, this
+/// finds the same file in the parent index and compares chunk texts.
+/// Chunks with identical text reuse the parent's embedding.
+///
+/// Returns the number of embeddings reused.
+fn prefill_reusable_embeddings(
+    repo: &gix::Repository,
+    new_index_path: &Path,
+    new_file_infos: &[FileChunkInfo],
+    parent_path: &Path,
+    parent_commit_hex: &str,
+) -> Result<usize> {
+    let old_reader = MmapIndexReader::open(parent_path)?;
+
+    // Reconstruct old file infos by getting the entries at the parent
+    // commit and mapping positions back to paths.
+    let old_entries = git::entries_at_commit(repo, parent_commit_hex)?;
+    let old_data = std::fs::read(parent_path)?;
+    let old_file_infos = match index::read_file_infos(&old_data, &old_entries) {
+        Ok(infos) => infos,
+        Err(e) => {
+            eprintln!("  warn: cannot read parent index metadata: {}", e);
+            return Ok(0);
+        }
+    };
+
+    // Build path → old file info index.
+    let old_path_to_idx: HashMap<&str, usize> = old_file_infos
+        .iter()
+        .enumerate()
+        .map(|(i, info)| (info.path.as_str(), i))
+        .collect();
+
+    // Parse the new index layout for writing pre-filled embeddings.
+    let new_data = std::fs::read(new_index_path)?;
+    let new_layout = index::index_layout(&new_data)?;
+    drop(new_data);
+
+    let mut locations: Vec<(usize, usize)> = Vec::new();
+    let mut embeddings: Vec<BinaryEmbedding> = Vec::new();
+
+    for (fi, info) in new_file_infos.iter().enumerate() {
+        // Find this file in the old index by path.
+        let old_fi = match old_path_to_idx.get(info.path.as_str()) {
+            Some(&idx) => idx,
+            None => continue, // new file, no reuse possible
+        };
+
+        let old_emb_range = old_reader.file_embedding_range(old_fi);
+        let old_chunk_lengths = old_reader.file_chunk_lengths(old_fi);
+
+        // Read old file content from git at the parent commit.
+        let old_content = match git::read_blob(repo, parent_commit_hex, &info.path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Read new file content from HEAD.
+        let new_content = match git::read_blob_at_head(repo, &info.path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Build a map of old chunk text → old embedding.
+        let mut old_text_to_emb: HashMap<&[u8], BinaryEmbedding> = HashMap::new();
+        let mut old_offset = 0usize;
+        for (ci, &len) in old_chunk_lengths.iter().enumerate() {
+            let end = old_offset + len as usize;
+            if end <= old_content.len() {
+                let text = &old_content[old_offset..end];
+                let emb_idx = old_emb_range.start + ci;
+                let emb = old_reader.embedding(emb_idx);
+                // Only reuse non-zero embeddings (zero = not yet embedded).
+                if !emb.iter().all(|&b| b == 0) {
+                    old_text_to_emb.insert(text, *emb);
+                }
+            }
+            old_offset = end;
+        }
+
+        // For each new chunk, check if its text matches an old chunk.
+        let mut new_offset = 0usize;
+        for (ci, &len) in info.chunk_lengths.iter().enumerate() {
+            let end = new_offset + len as usize;
+            if end <= new_content.len() {
+                let text = &new_content[new_offset..end];
+                if let Some(emb) = old_text_to_emb.get(text) {
+                    locations.push((fi, ci));
+                    embeddings.push(*emb);
+                }
+            }
+            new_offset = end;
+        }
+    }
+
+    let count = locations.len();
+    if !locations.is_empty() {
+        index::write_embeddings_scattered(
+            new_index_path,
+            &new_layout,
+            &locations,
+            &embeddings,
+        )?;
+    }
+
+    Ok(count)
+}
+

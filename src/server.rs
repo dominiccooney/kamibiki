@@ -267,7 +267,10 @@ async fn tool_search(args: &Value) -> Result<String> {
         return Ok("No results found.".to_string());
     }
 
-    let entries = git::index_entries(&repo)?;
+    // Resolve file positions → paths and read content from the
+    // commit that was actually indexed, not the current HEAD.
+    let indexed_commit = commit_hash_to_hex(&reader.header().commit_hash);
+    let entries = git::entries_at_commit(&repo, &indexed_commit)?;
 
     let mut chunk_contents: Vec<String> = Vec::new();
     let mut chunk_paths: Vec<String> = Vec::new();
@@ -280,7 +283,7 @@ async fn tool_search(args: &Value) -> Result<String> {
             .map(|(_, p)| p.as_str())
             .unwrap_or("<unknown>");
 
-        let content = git::read_blob_at_head(&repo, path).unwrap_or_default();
+        let content = git::read_blob(&repo, &indexed_commit, path).unwrap_or_default();
 
         let offset = result.chunk_ref.byte_offset as usize;
         let len = result.chunk_ref.chunk_len as usize;
@@ -388,12 +391,8 @@ fn tool_status(args: &Value) -> Result<String> {
             output.push_str(&format!("  Total index size: {}\n", format_bytes(total_size)));
 
             if let Ok(reader) = MmapIndexReader::open(&kbi_files[0].path()) {
-                let commit_hex = hex_encode(&reader.header().commit_hash);
-                let short = &commit_hex[..commit_hex
-                    .find(|c| c == '0')
-                    .unwrap_or(commit_hex.len())
-                    .max(8)
-                    .min(commit_hex.len())];
+                let commit_hex = commit_hash_to_hex(&reader.header().commit_hash);
+                let short = &commit_hex[..commit_hex.len().min(12)];
                 output.push_str(&format!("  Latest indexed commit: {}\n", short));
                 output.push_str(&format!("  Files in latest index: {}\n", reader.file_count()));
                 output.push_str(&format!(
@@ -482,6 +481,10 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+
+/// Extract the commit hash hex string from a GitHash (stored as ASCII
+/// hex bytes padded with zeroes).
+fn commit_hash_to_hex(hash: &GitHash) -> String {
+    let end = hash.iter().position(|&b| b == 0).unwrap_or(hash.len());
+    String::from_utf8_lossy(&hash[..end]).into_owned()
 }

@@ -129,6 +129,25 @@ impl MmapIndexReader {
     pub fn file_count(&self) -> usize {
         self.git_positions.len()
     }
+
+    /// Get the range of flat embedding indices for a specific included
+    /// file. Use with `embedding()` to read individual embeddings.
+    pub fn file_embedding_range(&self, file_idx: usize) -> std::ops::Range<usize> {
+        self.chunk_prefix[file_idx]..self.chunk_prefix[file_idx + 1]
+    }
+
+    /// Get the chunk lengths for a specific included file.
+    pub fn file_chunk_lengths(&self, file_idx: usize) -> &[u16] {
+        let start = self.chunk_prefix[file_idx];
+        let end = self.chunk_prefix[file_idx + 1];
+        &self.chunk_lengths[start..end]
+    }
+
+    /// Find the internal file index for a given git index position.
+    /// Returns `None` if the position is not in this index.
+    pub fn find_file_by_git_position(&self, git_pos: usize) -> Option<usize> {
+        self.git_positions.binary_search(&git_pos).ok()
+    }
 }
 
 impl IndexReader for MmapIndexReader {
@@ -407,6 +426,41 @@ mod tests {
         f.write_all(&[0u8; 10]).unwrap();
         drop(f);
         assert!(MmapIndexReader::open(&path).is_err());
+    }
+
+    #[test]
+    fn file_embedding_range_and_chunk_lengths() {
+        let header = make_header(0x01, 0);
+        let entries = vec![
+            FileEntry {
+                git_index_position: 0,
+                chunks: vec![
+                    ChunkEntry { byte_offset: 0, chunk_len: 100, embedding: make_embedding(0xA0) },
+                    ChunkEntry { byte_offset: 100, chunk_len: 200, embedding: make_embedding(0xA1) },
+                ],
+            },
+            FileEntry {
+                git_index_position: 3,
+                chunks: vec![
+                    ChunkEntry { byte_offset: 0, chunk_len: 50, embedding: make_embedding(0xB0) },
+                ],
+            },
+        ];
+        let reader = write_and_read(&header, &entries);
+
+        // file_embedding_range
+        assert_eq!(reader.file_embedding_range(0), 0..2);
+        assert_eq!(reader.file_embedding_range(1), 2..3);
+
+        // file_chunk_lengths
+        assert_eq!(reader.file_chunk_lengths(0), &[100, 200]);
+        assert_eq!(reader.file_chunk_lengths(1), &[50]);
+
+        // find_file_by_git_position
+        assert_eq!(reader.find_file_by_git_position(0), Some(0));
+        assert_eq!(reader.find_file_by_git_position(3), Some(1));
+        assert_eq!(reader.find_file_by_git_position(1), None);
+        assert_eq!(reader.find_file_by_git_position(99), None);
     }
 
     #[test]

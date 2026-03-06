@@ -242,20 +242,29 @@ pub fn index_layout(data: &[u8]) -> Result<IndexLayout> {
     })
 }
 
-/// Detect files with all-zero embeddings (incomplete / not yet
-/// embedded). Returns indices into the file_infos array.
+/// Detect files with at least one zero embedding (incomplete / not
+/// yet fully embedded). Returns indices into the file_infos array.
+///
+/// This checks every chunk in each file, not just the first, so it
+/// correctly handles files where some chunks have pre-filled
+/// embeddings (e.g. reused from a parent index during delta
+/// indexing).
 pub fn detect_incomplete(data: &[u8], layout: &IndexLayout) -> Vec<usize> {
     let mut incomplete = Vec::new();
     for i in 0..layout.num_files {
-        let count = layout.chunk_prefix[i + 1] - layout.chunk_prefix[i];
-        if count == 0 {
+        let start = layout.chunk_prefix[i];
+        let end = layout.chunk_prefix[i + 1];
+        if start == end {
             continue; // no chunks, nothing to embed
         }
-        let off = layout.embeddings_offset + layout.chunk_prefix[i] * EMBEDDING_BYTES;
-        if off + EMBEDDING_BYTES <= data.len()
-            && data[off..off + EMBEDDING_BYTES].iter().all(|&b| b == 0)
-        {
-            incomplete.push(i);
+        for j in start..end {
+            let off = layout.embeddings_offset + j * EMBEDDING_BYTES;
+            if off + EMBEDDING_BYTES <= data.len()
+                && data[off..off + EMBEDDING_BYTES].iter().all(|&b| b == 0)
+            {
+                incomplete.push(i);
+                break;
+            }
         }
     }
     incomplete
@@ -591,6 +600,60 @@ mod tests {
         assert_eq!(data[off], 0xAA);
         assert_eq!(data[off + EMBEDDING_BYTES], 0xBB);
         assert_eq!(data[off + EMBEDDING_BYTES * 2], 0xCC);
+    }
+
+    #[test]
+    fn detect_incomplete_with_partial_prefill() {
+        // Simulate delta indexing where some chunks in a file are
+        // pre-filled (reused from parent) and others are still zero.
+        let header = make_header();
+        let file_infos = vec![
+            FileChunkInfo {
+                git_index_position: 0,
+                path: "a.rs".to_string(),
+                chunk_lengths: vec![100, 50, 75],
+            },
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.kbi");
+
+        write_skeleton(&path, &header, &file_infos).unwrap();
+
+        // Pre-fill only the first chunk's embedding.
+        let data = std::fs::read(&path).unwrap();
+        let layout = index_layout(&data).unwrap();
+        drop(data);
+
+        let emb = make_embedding(0xAA);
+        write_embeddings_at(&path, &layout, 0, &[emb]).unwrap();
+
+        // The file should still be flagged as incomplete because
+        // chunks 1 and 2 are still zero.
+        let data = std::fs::read(&path).unwrap();
+        let incomplete = detect_incomplete(&data, &layout);
+        assert_eq!(incomplete, vec![0]);
+
+        // Now fill chunk 1 but leave chunk 2 zero.
+        drop(data);
+        // Write at the second chunk position.
+        let locations = vec![(0usize, 1usize)];
+        let embs = vec![make_embedding(0xBB)];
+        write_embeddings_scattered(&path, &layout, &locations, &embs).unwrap();
+
+        let data = std::fs::read(&path).unwrap();
+        let incomplete = detect_incomplete(&data, &layout);
+        assert_eq!(incomplete, vec![0]); // still incomplete (chunk 2 is zero)
+
+        // Fill chunk 2.
+        drop(data);
+        let locations = vec![(0usize, 2usize)];
+        let embs = vec![make_embedding(0xCC)];
+        write_embeddings_scattered(&path, &layout, &locations, &embs).unwrap();
+
+        let data = std::fs::read(&path).unwrap();
+        let incomplete = detect_incomplete(&data, &layout);
+        assert!(incomplete.is_empty()); // all complete now
     }
 
     #[test]
