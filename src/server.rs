@@ -14,7 +14,7 @@ use crate::core::git;
 use crate::core::types::*;
 use crate::embed::{Embedder, VoyageEmbedder};
 use crate::index::{MmapIndexReader, IndexReader};
-use crate::search::{self, Reranker, VoyageReranker};
+use crate::search::{Reranker, VoyageReranker, chain_search, load_index_chain};
 
 // ── MCP stdio server ─────────────────────────────────────────────
 
@@ -254,39 +254,29 @@ async fn tool_search(args: &Value) -> Result<String> {
     let repo = git::open_repo(&repo_cfg.path)?;
 
     let kb_dir = repo_cfg.path.join(".kb");
-    let index_path = find_latest_index(&kb_dir)?;
-    let reader = MmapIndexReader::open(&index_path)?;
+    let chain = load_index_chain(&kb_dir)?;
 
     let embedder = VoyageEmbedder::new(api_key.clone());
     let query_embedding = embedder.embed_query(query).await?;
 
-    let vector_top_n = 200.min(reader.embedding_count());
-    let vector_results = search::vector_search(&query_embedding, &reader, vector_top_n)?;
+    let vector_top_n = 200;
+    let vector_results = chain_search(&chain, &repo, &query_embedding, vector_top_n)?;
 
     if vector_results.is_empty() {
         return Ok("No results found.".to_string());
     }
 
-    // Resolve file positions → paths and read content from the
-    // commit that was actually indexed, not the current HEAD.
-    let indexed_commit = commit_hash_to_hex(&reader.header().commit_hash);
-    let entries = git::entries_at_commit(&repo, &indexed_commit)?;
-
+    // Read chunk content from the commit each result came from.
     let mut chunk_contents: Vec<String> = Vec::new();
     let mut chunk_paths: Vec<String> = Vec::new();
     let mut chunk_offsets: Vec<(u32, u16)> = Vec::new();
 
     for result in &vector_results {
-        let file_idx = result.chunk_ref.file_index as usize;
-        let path = entries.iter()
-            .find(|(i, _)| *i == file_idx)
-            .map(|(_, p)| p.as_str())
-            .unwrap_or("<unknown>");
+        let content = git::read_blob(&repo, &result.commit_hex, &result.path)
+            .unwrap_or_default();
 
-        let content = git::read_blob(&repo, &indexed_commit, path).unwrap_or_default();
-
-        let offset = result.chunk_ref.byte_offset as usize;
-        let len = result.chunk_ref.chunk_len as usize;
+        let offset = result.byte_offset as usize;
+        let len = result.chunk_len as usize;
         let chunk_text = if offset + len <= content.len() {
             String::from_utf8_lossy(&content[offset..offset + len]).into_owned()
         } else if offset < content.len() {
@@ -296,8 +286,8 @@ async fn tool_search(args: &Value) -> Result<String> {
         };
 
         chunk_contents.push(chunk_text);
-        chunk_paths.push(path.to_string());
-        chunk_offsets.push((result.chunk_ref.byte_offset, result.chunk_ref.chunk_len));
+        chunk_paths.push(result.path.clone());
+        chunk_offsets.push((result.byte_offset, result.chunk_len));
     }
 
     let reranker = VoyageReranker::new(api_key);
