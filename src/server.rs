@@ -4,7 +4,6 @@
 //! `kb_search` as MCP tools.
 
 use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -254,7 +253,7 @@ async fn tool_search(args: &Value) -> Result<String> {
     let repo = git::open_repo(&repo_cfg.path)?;
 
     let kb_dir = repo_cfg.path.join(".kb");
-    let chain = load_index_chain(&kb_dir)?;
+    let chain = load_index_chain(&kb_dir, &repo)?;
 
     let embedder = VoyageEmbedder::new(api_key.clone());
     let query_embedding = embedder.embed_query(query).await?;
@@ -424,41 +423,6 @@ fn resolve_repo<'a>(cfg: &'a KbConfig, name: &str) -> Result<&'a RepoConfig> {
             .find(|r| r.name == name)
             .ok_or_else(|| anyhow::anyhow!("unknown repository: '{}'", name))
     }
-}
-
-fn find_latest_index(kb_dir: &Path) -> Result<PathBuf> {
-    if !kb_dir.exists() {
-        anyhow::bail!(
-            "No index directory found at {}. Run 'kb index' first.",
-            kb_dir.display()
-        );
-    }
-
-    let mut kbi_files: Vec<_> = std::fs::read_dir(kb_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "kbi")
-        })
-        .collect();
-
-    if kbi_files.is_empty() {
-        anyhow::bail!(
-            "No index files found in {}. Run 'kb index' first.",
-            kb_dir.display()
-        );
-    }
-
-    kbi_files.sort_by_key(|e| {
-        std::cmp::Reverse(
-            e.metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-        )
-    });
-
-    Ok(kbi_files[0].path())
 }
 
 fn format_bytes(bytes: u64) -> String {

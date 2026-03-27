@@ -114,15 +114,29 @@ pub fn chain_search(
     Ok(all_results)
 }
 
-/// Load the chain of index files starting from the latest, walking
-/// the parent hash links. Returns readers ordered newest-first.
+/// Load the chain of index files starting from the most recent
+/// ancestor of HEAD that has been indexed, then walking the
+/// parent hash links. Returns readers ordered newest-first.
+///
+/// The chain start is found by walking HEAD's git ancestors
+/// (a fast DAG traversal) and checking each commit against the
+/// set of indexed commits (read from .kbi file headers, 65 bytes
+/// each). The chain then follows the parent_hash links embedded
+/// in each index file until a root index or missing parent is
+/// reached.
+pub fn load_index_chain(kb_dir: &Path, repo: &gix::Repository) -> Result<Vec<MmapIndexReader>> {
+    let start_path = find_chain_start(kb_dir, repo)?;
+    walk_index_chain(kb_dir, start_path)
+}
+
+/// Walk a chain of indexes from a starting .kbi file, following
+/// parent hash links. Returns readers ordered newest-first.
 ///
 /// The chain stops when a root index (parent_hash all zeroes) is
 /// reached, or when the parent index file cannot be found.
-pub fn load_index_chain(kb_dir: &Path) -> Result<Vec<MmapIndexReader>> {
-    let latest_path = find_latest_index(kb_dir)?;
+fn walk_index_chain(kb_dir: &Path, start_path: PathBuf) -> Result<Vec<MmapIndexReader>> {
     let mut chain = Vec::new();
-    let mut current_path = latest_path;
+    let mut current_path = start_path;
 
     loop {
         let reader = MmapIndexReader::open(&current_path)?;
@@ -142,15 +156,14 @@ pub fn load_index_chain(kb_dir: &Path) -> Result<Vec<MmapIndexReader>> {
     Ok(chain)
 }
 
-/// Extract the commit hash hex string from a GitHash (stored as ASCII
-/// hex bytes padded with zeroes).
-fn commit_hash_to_hex(hash: &GitHash) -> String {
-    let end = hash.iter().position(|&b| b == 0).unwrap_or(hash.len());
-    String::from_utf8_lossy(&hash[..end]).into_owned()
-}
-
-/// Find the most recent .kbi file in a directory by modification time.
-fn find_latest_index(kb_dir: &Path) -> Result<PathBuf> {
+/// Find the best starting index by walking HEAD's git ancestors
+/// until we find a commit that has a .kbi file.
+///
+/// This reads only the first 65 bytes of each .kbi file (version
+/// byte + commit hash) and walks the git commit DAG, which reads
+/// only small commit objects. Both operations are fast even for
+/// large repositories.
+fn find_chain_start(kb_dir: &Path, repo: &gix::Repository) -> Result<PathBuf> {
     if !kb_dir.exists() {
         anyhow::bail!(
             "No index directory found at {}. Run 'kb index' first.",
@@ -158,31 +171,84 @@ fn find_latest_index(kb_dir: &Path) -> Result<PathBuf> {
         );
     }
 
-    let mut kbi_files: Vec<_> = std::fs::read_dir(kb_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "kbi")
-        })
-        .collect();
-
-    if kbi_files.is_empty() {
+    // Build commit_hex → path map from all .kbi file headers.
+    let indexed = scan_indexed_commits(kb_dir)?;
+    if indexed.is_empty() {
         anyhow::bail!(
             "No index files found in {}. Run 'kb index' first.",
             kb_dir.display()
         );
     }
 
-    kbi_files.sort_by_key(|e| {
-        std::cmp::Reverse(
-            e.metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-        )
-    });
+    // Walk HEAD's ancestors (including HEAD itself) to find the
+    // first commit that has an index file.
+    let head = repo.head_commit()
+        .context("failed to resolve HEAD commit")?;
 
-    Ok(kbi_files[0].path())
+    // Check HEAD itself first (fast path — the common case after
+    // running `kb index`).
+    let head_hex = head.id().to_hex().to_string();
+    if let Some(path) = indexed.get(&head_hex) {
+        return Ok(path.clone());
+    }
+
+    // Walk ancestors in topological order (newest first).
+    let walk = repo.rev_walk([head.id().detach()])
+        .all()
+        .context("failed to start ancestor walk")?;
+
+    for info in walk {
+        let info = info.context("error during ancestor walk")?;
+        let hex = info.id.to_hex().to_string();
+        if let Some(path) = indexed.get(&hex) {
+            return Ok(path.clone());
+        }
+    }
+
+    anyhow::bail!(
+        "No indexed ancestor of HEAD found in {}. Run 'kb index' first.",
+        kb_dir.display()
+    );
+}
+
+/// Scan all .kbi files in a directory and build a map of
+/// commit hash (hex) → file path. Reads only the first 65 bytes
+/// of each file (version byte + commit hash).
+fn scan_indexed_commits(kb_dir: &Path) -> Result<HashMap<String, PathBuf>> {
+    let mut map = HashMap::new();
+    for entry in std::fs::read_dir(kb_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "kbi") {
+            if let Ok(hash) = read_commit_hash_from_header(&path) {
+                if !hash.is_empty() {
+                    map.insert(hash, path);
+                }
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// Read just the commit hash from a .kbi file header without
+/// parsing the rest of the file. Reads exactly `1 + MAX_HASH_LEN`
+/// (65) bytes.
+fn read_commit_hash_from_header(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = [0u8; 1 + MAX_HASH_LEN];
+    file.read_exact(&mut buf)?;
+    // commit_hash starts at byte 1 (after version byte).
+    let hash_bytes = &buf[1..];
+    let end = hash_bytes.iter().position(|&b| b == 0).unwrap_or(MAX_HASH_LEN);
+    Ok(String::from_utf8_lossy(&hash_bytes[..end]).into_owned())
+}
+
+/// Extract the commit hash hex string from a GitHash (stored as ASCII
+/// hex bytes padded with zeroes).
+fn commit_hash_to_hex(hash: &GitHash) -> String {
+    let end = hash.iter().position(|&b| b == 0).unwrap_or(hash.len());
+    String::from_utf8_lossy(&hash[..end]).into_owned()
 }
 
 /// Find an index file whose commit hash matches the given hex string.
@@ -217,7 +283,6 @@ fn find_index_by_commit(kb_dir: &Path, commit_hex: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::*;
     use crate::index::format::write_index;
     use crate::index::{ChunkEntry, FileEntry};
 
@@ -242,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn load_chain_single_root_index() {
+    fn walk_chain_single_root_index() {
         let dir = tempfile::tempdir().unwrap();
         let kb_dir = dir.path();
 
@@ -255,9 +320,10 @@ mod tests {
                 embedding: make_embedding(0xAA),
             }],
         }];
-        write_index(&kb_dir.join("aaaa.kbi"), &header, &entries).unwrap();
+        let start = kb_dir.join("aaaa.kbi");
+        write_index(&start, &header, &entries).unwrap();
 
-        let chain = load_index_chain(kb_dir).unwrap();
+        let chain = walk_index_chain(kb_dir, start).unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(
             commit_hash_to_hex(&chain[0].header().commit_hash),
@@ -266,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn load_chain_two_indexes() {
+    fn walk_chain_two_indexes() {
         let dir = tempfile::tempdir().unwrap();
         let kb_dir = dir.path();
 
@@ -283,8 +349,6 @@ mod tests {
         write_index(&kb_dir.join("aaaa.kbi"), &root_header, &root_entries).unwrap();
 
         // Delta index at commit "bbbb" with parent "aaaa"
-        // Sleep briefly to ensure different mtime
-        std::thread::sleep(std::time::Duration::from_millis(10));
         let delta_header = make_header("bbbb", "aaaa");
         let delta_entries = vec![FileEntry {
             git_index_position: 1,
@@ -294,9 +358,10 @@ mod tests {
                 embedding: make_embedding(0xBB),
             }],
         }];
-        write_index(&kb_dir.join("bbbb.kbi"), &delta_header, &delta_entries).unwrap();
+        let start = kb_dir.join("bbbb.kbi");
+        write_index(&start, &delta_header, &delta_entries).unwrap();
 
-        let chain = load_index_chain(kb_dir).unwrap();
+        let chain = walk_index_chain(kb_dir, start).unwrap();
         assert_eq!(chain.len(), 2);
         // Newest first
         assert_eq!(
@@ -310,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn load_chain_broken_link() {
+    fn walk_chain_broken_link() {
         let dir = tempfile::tempdir().unwrap();
         let kb_dir = dir.path();
 
@@ -324,9 +389,10 @@ mod tests {
                 embedding: make_embedding(0xCC),
             }],
         }];
-        write_index(&kb_dir.join("cccc.kbi"), &header, &entries).unwrap();
+        let start = kb_dir.join("cccc.kbi");
+        write_index(&start, &header, &entries).unwrap();
 
-        let chain = load_index_chain(kb_dir).unwrap();
+        let chain = walk_index_chain(kb_dir, start).unwrap();
         // Chain should contain just the one index (broken link)
         assert_eq!(chain.len(), 1);
     }
@@ -370,5 +436,39 @@ mod tests {
 
         let found = find_index_by_commit(kb_dir, "deadbeef");
         assert!(found.is_some());
+    }
+
+    #[test]
+    fn scan_indexed_commits_finds_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let kb_dir = dir.path();
+
+        write_index(
+            &kb_dir.join("aaaa.kbi"),
+            &make_header("aaaa1111", ""),
+            &[],
+        ).unwrap();
+        write_index(
+            &kb_dir.join("bbbb.kbi"),
+            &make_header("bbbb2222", "aaaa1111"),
+            &[],
+        ).unwrap();
+
+        let indexed = scan_indexed_commits(kb_dir).unwrap();
+        assert_eq!(indexed.len(), 2);
+        assert!(indexed.contains_key("aaaa1111"));
+        assert!(indexed.contains_key("bbbb2222"));
+    }
+
+    #[test]
+    fn read_commit_hash_from_header_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.kbi");
+
+        let header = make_header("deadbeef42", "");
+        write_index(&path, &header, &[]).unwrap();
+
+        let hash = read_commit_hash_from_header(&path).unwrap();
+        assert_eq!(hash, "deadbeef42");
     }
 }
