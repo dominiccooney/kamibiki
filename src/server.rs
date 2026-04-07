@@ -13,7 +13,7 @@ use crate::core::git;
 use crate::core::types::*;
 use crate::embed::{Embedder, VoyageEmbedder};
 use crate::index::{MmapIndexReader, IndexReader};
-use crate::search::{Reranker, VoyageReranker, chain_search, load_index_chain};
+use crate::search::{Reranker, VoyageReranker, chain_search, load_index_chain, IndexChain};
 
 // ── MCP stdio server ─────────────────────────────────────────────
 
@@ -253,7 +253,7 @@ async fn tool_search(args: &Value) -> Result<String> {
     let repo = git::open_repo(&repo_cfg.path)?;
 
     let kb_dir = repo_cfg.path.join(".kb");
-    let chain = load_index_chain(&kb_dir, &repo)?;
+    let IndexChain { readers: chain, commits_behind } = load_index_chain(&kb_dir, &repo)?;
 
     let embedder = VoyageEmbedder::new(api_key.clone());
     let query_embedding = embedder.embed_query(query).await?;
@@ -294,6 +294,15 @@ async fn tool_search(args: &Value) -> Result<String> {
     let reranked = reranker.rerank(query, &doc_refs, top).await?;
 
     let mut output = String::new();
+
+    if commits_behind > 0 {
+        output.push_str(&format!(
+            "Note: index is {} commit{} behind HEAD. Run 'kb index' to update.\n\n",
+            commits_behind,
+            if commits_behind == 1 { "" } else { "s" },
+        ));
+    }
+
     for (rank, item) in reranked.iter().enumerate() {
         let path = &chunk_paths[item.index];
         let (byte_offset, byte_len) = chunk_offsets[item.index];

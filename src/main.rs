@@ -14,7 +14,7 @@ use kb::core::git;
 use kb::core::types::*;
 use kb::embed::{Embedder, VoyageEmbedder};
 use kb::index::{self, FileChunkInfo, MmapIndexReader, IndexReader};
-use kb::search::{Reranker, VoyageReranker, chain_search, load_index_chain};
+use kb::search::{Reranker, VoyageReranker, chain_search, load_index_chain, IndexChain};
 
 #[derive(Parser)]
 #[command(name = "kb", about = "Kamibiki - contextual search for git repos")]
@@ -832,7 +832,7 @@ async fn cmd_search(name: &str, query: &str, top: usize) -> Result<()> {
     let repo = git::open_repo(&repo_cfg.path)?;
 
     let kb_dir = repo_cfg.path.join(".kb");
-    let chain = load_index_chain(&kb_dir, &repo)?;
+    let IndexChain { readers: chain, commits_behind } = load_index_chain(&kb_dir, &repo)?;
 
     let total_embeddings: usize = chain.iter().map(|r| r.embedding_count()).sum();
     eprintln!(
@@ -842,6 +842,13 @@ async fn cmd_search(name: &str, query: &str, top: usize) -> Result<()> {
         if chain.len() == 1 { "" } else { "s" },
         total_embeddings,
     );
+    if commits_behind > 0 {
+        eprintln!(
+            "Note: index is {} commit{} behind HEAD. Run 'kb index' to update.",
+            commits_behind,
+            if commits_behind == 1 { "" } else { "s" },
+        );
+    }
 
     let embedder = VoyageEmbedder::new(api_key.clone());
     let query_embedding = embedder.embed_query(query).await?;
