@@ -140,6 +140,87 @@ pub fn entries_at_commit(
         .collect())
 }
 
+/// Describes how a snippet relates to the current file on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnippetStaleness {
+    /// The snippet matches the file on disk at the same byte offset.
+    Current,
+    /// The file exists on disk and the snippet text appears in it,
+    /// but at a different byte offset — the code may have moved.
+    Moved,
+    /// The file exists on disk but the snippet text does not appear
+    /// in it at all — the code may have been modified.
+    Modified,
+    /// The file was not found on disk — it may have been renamed or
+    /// removed.
+    Missing,
+}
+
+impl SnippetStaleness {
+    /// Returns a short human-readable note, or `None` if the snippet
+    /// appears current.
+    pub fn note(&self) -> Option<&'static str> {
+        match self {
+            SnippetStaleness::Current => None,
+            SnippetStaleness::Moved => {
+                Some("(note: this snippet may have moved — the file on disk differs at this offset)")
+            }
+            SnippetStaleness::Modified => {
+                Some("(note: this snippet may have changed — the file on disk differs from the indexed version)")
+            }
+            SnippetStaleness::Missing => {
+                Some("(note: this file was not found on disk — it may have been renamed or removed)")
+            }
+        }
+    }
+}
+
+/// Check whether a snippet from the index still matches the file on
+/// disk. Compares the indexed chunk text against the current working
+/// tree file at `repo_root / path`.
+///
+/// `chunk_text` is the snippet content as extracted from the indexed
+/// commit. `byte_offset` and `chunk_len` are the byte range within
+/// the file where the chunk was originally found.
+pub fn check_snippet_staleness(
+    repo_root: &Path,
+    path: &str,
+    byte_offset: usize,
+    chunk_len: usize,
+    chunk_text: &[u8],
+) -> SnippetStaleness {
+    let disk_path = repo_root.join(path);
+    let disk_content = match std::fs::read(&disk_path) {
+        Ok(c) => c,
+        Err(_) => return SnippetStaleness::Missing,
+    };
+
+    // Check whether the chunk matches at the original byte offset.
+    let end = byte_offset + chunk_len;
+    if end <= disk_content.len()
+        && disk_content[byte_offset..end] == *chunk_text
+    {
+        return SnippetStaleness::Current;
+    }
+
+    // The chunk doesn't match at the original offset. Check whether
+    // the text appears anywhere in the file (it may have moved due
+    // to edits above it).
+    if !chunk_text.is_empty() && find_subsequence(&disk_content, chunk_text).is_some() {
+        return SnippetStaleness::Moved;
+    }
+
+    SnippetStaleness::Modified
+}
+
+/// Find the first occurrence of `needle` in `haystack`.
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// Recursively collect all non-tree entry paths from a tree object.
 /// Includes blobs, symlinks, and submodule (gitlink) entries to match
 /// the enumeration produced by `index_entries()`, which includes all
@@ -175,4 +256,130 @@ fn collect_tree_entries(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staleness_current_when_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        std::fs::write(&file, b"aaabbbccc").unwrap();
+
+        let result = check_snippet_staleness(
+            dir.path(),
+            "hello.txt",
+            3, // byte_offset
+            3, // chunk_len
+            b"bbb",
+        );
+        assert_eq!(result, SnippetStaleness::Current);
+        assert!(result.note().is_none());
+    }
+
+    #[test]
+    fn staleness_moved_when_offset_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        // Original: "aaabbbccc", chunk "bbb" at offset 3.
+        // Disk now has extra bytes prepended, shifting "bbb" to offset 6.
+        std::fs::write(&file, b"XXXaaabbbccc").unwrap();
+
+        let result = check_snippet_staleness(
+            dir.path(),
+            "hello.txt",
+            3, // original offset
+            3,
+            b"bbb",
+        );
+        assert_eq!(result, SnippetStaleness::Moved);
+        assert!(result.note().is_some());
+        assert!(result.note().unwrap().contains("moved"));
+    }
+
+    #[test]
+    fn staleness_modified_when_text_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        std::fs::write(&file, b"completely different content").unwrap();
+
+        let result = check_snippet_staleness(
+            dir.path(),
+            "hello.txt",
+            0,
+            3,
+            b"bbb",
+        );
+        assert_eq!(result, SnippetStaleness::Modified);
+        assert!(result.note().is_some());
+        assert!(result.note().unwrap().contains("changed"));
+    }
+
+    #[test]
+    fn staleness_missing_when_file_gone() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = check_snippet_staleness(
+            dir.path(),
+            "nonexistent.txt",
+            0,
+            3,
+            b"abc",
+        );
+        assert_eq!(result, SnippetStaleness::Missing);
+        assert!(result.note().is_some());
+        assert!(result.note().unwrap().contains("not found"));
+    }
+
+    #[test]
+    fn staleness_current_at_start_of_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, b"hello world").unwrap();
+
+        let result = check_snippet_staleness(
+            dir.path(),
+            "f.txt",
+            0,
+            5,
+            b"hello",
+        );
+        assert_eq!(result, SnippetStaleness::Current);
+    }
+
+    #[test]
+    fn staleness_modified_when_file_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        // Chunk was at offset 10 len 5, but file is now only 8 bytes.
+        std::fs::write(&file, b"short").unwrap();
+
+        let result = check_snippet_staleness(
+            dir.path(),
+            "f.txt",
+            10,
+            5,
+            b"xxxxx",
+        );
+        assert_eq!(result, SnippetStaleness::Modified);
+    }
+
+    #[test]
+    fn staleness_subdirectory_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("lib.rs"), b"fn main() {}").unwrap();
+
+        let result = check_snippet_staleness(
+            dir.path(),
+            "src/lib.rs",
+            0,
+            12,
+            b"fn main() {}",
+        );
+        assert_eq!(result, SnippetStaleness::Current);
+    }
 }

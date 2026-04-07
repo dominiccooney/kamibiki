@@ -303,14 +303,25 @@ async fn tool_search(args: &Value) -> Result<String> {
             output.push('\n');
         }
         output.push_str(&format!(
-            "━━━ Result {} ━━━ {} (offset {}, len {}) [score: {:.4}]\n{}",
+            "━━━ Result {} ━━━ {} (offset {}, len {}) [score: {:.4}]\n",
             rank + 1,
             path,
             byte_offset,
             byte_len,
             item.relevance_score,
-            content,
         ));
+        let staleness = git::check_snippet_staleness(
+            &repo_cfg.path,
+            path,
+            byte_offset as usize,
+            byte_len as usize,
+            content.as_bytes(),
+        );
+        if let Some(note) = staleness.note() {
+            output.push_str(note);
+            output.push('\n');
+        }
+        output.push_str(content);
     }
 
     Ok(output)

@@ -904,6 +904,16 @@ async fn cmd_search(name: &str, query: &str, top: usize) -> Result<()> {
             byte_len,
             item.relevance_score
         )?;
+        let staleness = git::check_snippet_staleness(
+            &repo_cfg.path,
+            path,
+            byte_offset as usize,
+            byte_len as usize,
+            content.as_bytes(),
+        );
+        if let Some(note) = staleness.note() {
+            writeln!(out, "{}", note)?;
+        }
         writeln!(out, "{}", content)?;
     }
 
