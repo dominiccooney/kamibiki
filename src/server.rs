@@ -269,6 +269,7 @@ async fn tool_search(args: &Value) -> Result<String> {
     let mut chunk_contents: Vec<String> = Vec::new();
     let mut chunk_paths: Vec<String> = Vec::new();
     let mut chunk_offsets: Vec<(u32, u16)> = Vec::new();
+    let mut chunk_start_lines: Vec<usize> = Vec::new();
 
     for result in &vector_results {
         let content = git::read_blob(&repo, &result.commit_hex, &result.path)
@@ -276,6 +277,7 @@ async fn tool_search(args: &Value) -> Result<String> {
 
         let offset = result.byte_offset as usize;
         let len = result.chunk_len as usize;
+        let start_line = crate::snippet::start_line_for_offset(&content, offset);
         let chunk_text = if offset + len <= content.len() {
             String::from_utf8_lossy(&content[offset..offset + len]).into_owned()
         } else if offset < content.len() {
@@ -287,6 +289,7 @@ async fn tool_search(args: &Value) -> Result<String> {
         chunk_contents.push(chunk_text);
         chunk_paths.push(result.path.clone());
         chunk_offsets.push((result.byte_offset, result.chunk_len));
+        chunk_start_lines.push(start_line);
     }
 
     let reranker = VoyageReranker::new(api_key);
@@ -307,10 +310,12 @@ async fn tool_search(args: &Value) -> Result<String> {
         let path = &chunk_paths[item.index];
         let (byte_offset, byte_len) = chunk_offsets[item.index];
         let content = &chunk_contents[item.index];
+        let start_line = chunk_start_lines[item.index];
 
         if rank > 0 {
             output.push('\n');
         }
+        let numbered = crate::snippet::format_with_line_numbers(content, start_line);
         output.push_str(&format!(
             "━━━ Result {} ━━━ {} (offset {}, len {}) [score: {:.4}]\n",
             rank + 1,
@@ -330,7 +335,7 @@ async fn tool_search(args: &Value) -> Result<String> {
             output.push_str(note);
             output.push('\n');
         }
-        output.push_str(content);
+        output.push_str(&numbered);
     }
 
     Ok(output)

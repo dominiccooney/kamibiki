@@ -13,6 +13,7 @@ use kb::core::config;
 use kb::core::git;
 use kb::core::types::*;
 use kb::embed::{Embedder, VoyageEmbedder};
+use kb::snippet;
 use kb::index::{self, FileChunkInfo, MmapIndexReader, IndexReader};
 use kb::search::{Reranker, VoyageReranker, chain_search, load_index_chain, IndexChain};
 
@@ -870,6 +871,7 @@ async fn cmd_search(name: &str, query: &str, top: usize) -> Result<()> {
     let mut chunk_contents: Vec<String> = Vec::new();
     let mut chunk_paths: Vec<String> = Vec::new();
     let mut chunk_offsets: Vec<(u32, u16)> = Vec::new();
+    let mut chunk_start_lines: Vec<usize> = Vec::new();
 
     for result in &vector_results {
         let content = git::read_blob(&repo, &result.commit_hex, &result.path)
@@ -877,6 +879,7 @@ async fn cmd_search(name: &str, query: &str, top: usize) -> Result<()> {
 
         let offset = result.byte_offset as usize;
         let len = result.chunk_len as usize;
+        let start_line = snippet::start_line_for_offset(&content, offset);
         let chunk_text = if offset + len <= content.len() {
             String::from_utf8_lossy(&content[offset..offset + len]).into_owned()
         } else if offset < content.len() {
@@ -888,6 +891,7 @@ async fn cmd_search(name: &str, query: &str, top: usize) -> Result<()> {
         chunk_contents.push(chunk_text);
         chunk_paths.push(result.path.clone());
         chunk_offsets.push((result.byte_offset, result.chunk_len));
+        chunk_start_lines.push(start_line);
     }
 
     let reranker = VoyageReranker::new(api_key);
@@ -901,6 +905,7 @@ async fn cmd_search(name: &str, query: &str, top: usize) -> Result<()> {
         let path = &chunk_paths[item.index];
         let (byte_offset, byte_len) = chunk_offsets[item.index];
         let content = &chunk_contents[item.index];
+        let start_line = chunk_start_lines[item.index];
 
         writeln!(
             out,
@@ -921,7 +926,8 @@ async fn cmd_search(name: &str, query: &str, top: usize) -> Result<()> {
         if let Some(note) = staleness.note() {
             writeln!(out, "{}", note)?;
         }
-        writeln!(out, "{}", content)?;
+        let numbered = snippet::format_with_line_numbers(content, start_line);
+        writeln!(out, "{}", numbered)?;
     }
 
     Ok(())
@@ -1122,7 +1128,9 @@ fn print_chunks(
             writeln!(out, "---")?;
         }
         let text = String::from_utf8_lossy(chunk.content(content));
-        write!(out, "{}", text)?;
+        let start_line = snippet::start_line_for_offset(content, chunk.byte_offset);
+        let numbered = snippet::format_with_line_numbers(&text, start_line);
+        write!(out, "{}", numbered)?;
     }
 
     if chunks
