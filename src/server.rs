@@ -1,7 +1,7 @@
 //! MCP (Model Context Protocol) server for Kamibiki.
 //!
-//! Implements JSON-RPC 2.0 over stdio, exposing `kb_status` and
-//! `kb_search` as MCP tools.
+//! Implements JSON-RPC 2.0 over stdio, exposing `kb_status`, `kb_search`,
+//! and `kb_index` as MCP tools.
 
 use std::io::{self, BufRead, Write};
 
@@ -13,6 +13,7 @@ use crate::core::git;
 use crate::core::types::*;
 use crate::embed::{Embedder, VoyageEmbedder};
 use crate::index::{MmapIndexReader, IndexReader};
+use crate::ops::{self, StderrProgress};
 use crate::search::{Reranker, VoyageReranker, chain_search, load_index_chain, IndexChain};
 
 // ── MCP stdio server ─────────────────────────────────────────────
@@ -130,7 +131,7 @@ fn handle_initialize(id: &Value) -> Value {
                 "name": "kamibiki",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "Kamibiki is a contextual code search engine for git repositories. Use kb_search to find relevant code chunks across indexed repositories. Use kb_status to list indexed repositories and their status."
+            "instructions": "Kamibiki is a contextual code search engine for git repositories. Use kb_search to find relevant code chunks across indexed repositories. Use kb_status to list indexed repositories and their status. Use kb_index to update the index for one or more repositories when the code has changed."
         }
     })
 }
@@ -178,6 +179,20 @@ fn handle_tools_list(id: &Value) -> Value {
                             }
                         }
                     }
+                },
+                {
+                    "name": "kb_index",
+                    "description": "Update the search index for one or more repositories. This chunks files, computes embeddings via the Voyage AI API, and writes the index. Supports delta indexing (only changed files are re-embedded). This operation can take seconds to minutes depending on repository size and number of changes. The operation is restartable: if interrupted, re-running will resume from where it left off.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "names": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Repository names to index. If omitted or empty, indexes all registered repositories."
+                            }
+                        }
+                    }
                 }
             ]
         }
@@ -200,6 +215,12 @@ async fn handle_tools_call(id: &Value, msg: &Value) -> Value {
         }
         "kb_status" => {
             match tool_status(&arguments) {
+                Ok(text) => tool_result(id, &text, false),
+                Err(e) => tool_result(id, &format!("Error: {:#}", e), true),
+            }
+        }
+        "kb_index" => {
+            match tool_index(&arguments).await {
                 Ok(text) => tool_result(id, &text, false),
                 Err(e) => tool_result(id, &format!("Error: {:#}", e), true),
             }
@@ -420,6 +441,70 @@ fn tool_status(args: &Value) -> Result<String> {
     Ok(output)
 }
 
+// ── kb_index tool ────────────────────────────────────────────────
+
+async fn tool_index(args: &Value) -> Result<String> {
+    let cfg = config::load_config()?;
+    let api_key = cfg
+        .voyage_api_key
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No Voyage API key configured. Run 'kb init' first."))?
+        .clone();
+
+    // Resolve which repos to index.
+    let names: Vec<String> = match args.get("names").and_then(|v| v.as_array()) {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let repo_names = resolve_names(&cfg, &names)?;
+    let progress = StderrProgress;
+    let mut output = String::new();
+
+    for (i, repo_name) in repo_names.iter().enumerate() {
+        let repo_cfg = resolve_repo(&cfg, repo_name)?;
+
+        let result = ops::index_repo(repo_cfg, &api_key, &progress).await
+            .map_err(|e| anyhow::anyhow!("failed to index '{}': {:#}", repo_cfg.name, e))?;
+
+        if i > 0 {
+            output.push('\n');
+        }
+
+        if result.already_up_to_date {
+            output.push_str(&format!(
+                "Repository '{}': index is up to date at commit {}.",
+                repo_name,
+                &result.commit_hex[..result.commit_hex.len().min(12)],
+            ));
+        } else if result.had_error {
+            output.push_str(&format!(
+                "Repository '{}': indexing partially completed at commit {} ({} files, {} chunks). \
+                 Some embedding requests failed; progress was saved. Re-run to resume.",
+                repo_name,
+                &result.commit_hex[..result.commit_hex.len().min(12)],
+                result.file_count,
+                result.total_chunks,
+            ));
+        } else {
+            let mode = if result.is_delta { "delta" } else { "full" };
+            output.push_str(&format!(
+                "Repository '{}': {} index complete at commit {} ({} files, {} chunks).",
+                repo_name,
+                mode,
+                &result.commit_hex[..result.commit_hex.len().min(12)],
+                result.file_count,
+                result.total_chunks,
+            ));
+        }
+    }
+
+    Ok(output)
+}
+
 // ── Helpers (shared with main.rs logic) ──────────────────────────
 
 fn resolve_repo<'a>(cfg: &'a KbConfig, name: &str) -> Result<&'a RepoConfig> {
@@ -448,6 +533,24 @@ fn resolve_repo<'a>(cfg: &'a KbConfig, name: &str) -> Result<&'a RepoConfig> {
             .find(|r| r.name == name)
             .ok_or_else(|| anyhow::anyhow!("unknown repository: '{}'", name))
     }
+}
+
+/// Resolve a list of repository names, expanding aliases and
+/// defaulting to all repos when the list is empty.
+fn resolve_names(cfg: &KbConfig, names: &[String]) -> Result<Vec<String>> {
+    if names.is_empty() {
+        return Ok(cfg.repos.iter().map(|r| r.name.clone()).collect());
+    }
+
+    let mut result = Vec::new();
+    for name in names {
+        if let Some(alias) = cfg.aliases.iter().find(|a| a.name == *name) {
+            result.extend(alias.repos.clone());
+        } else {
+            result.push(name.clone());
+        }
+    }
+    Ok(result)
 }
 
 fn format_bytes(bytes: u64) -> String {
