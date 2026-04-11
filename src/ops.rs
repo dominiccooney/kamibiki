@@ -103,21 +103,27 @@ pub struct IndexResult {
 
 /// Index a single repository. This is the core indexing pipeline,
 /// shared between the CLI and MCP server.
+///
+/// `commit` is an optional git revision spec (commit hash, branch
+/// name, tag, HEAD~1, etc.). When `None`, indexes at HEAD.
 pub async fn index_repo(
     repo_cfg: &RepoConfig,
     api_key: &str,
     progress: &dyn IndexProgress,
+    commit: Option<&str>,
 ) -> Result<IndexResult> {
     progress.on_start(&repo_cfg.name);
 
     let repo = git::open_repo(&repo_cfg.path)?;
-    let commit_hex = git::head_commit_hex(&repo)?;
+    let commit_hex = git::resolve_commit_hex(&repo, commit)?;
+    let ref_label = commit.unwrap_or("HEAD");
     progress.on_message(&format!(
-        "HEAD commit: {}",
+        "{} commit: {}",
+        ref_label,
         &commit_hex[..commit_hex.len().min(12)]
     ));
 
-    let entries = git::index_entries(&repo)?;
+    let entries = git::entries_at_commit(&repo, &commit_hex)?;
     progress.on_message(&format!("Tracked files: {}", entries.len()));
 
     let kb_dir = repo_cfg.path.join(".kb");
@@ -177,7 +183,7 @@ pub async fn index_repo(
                 .cloned()
                 .collect();
 
-            let mut infos = chunk_all_files(&repo_cfg.path, &changed_entries, progress)?;
+            let mut infos = chunk_all_files(&repo_cfg.path, &changed_entries, &commit_hex, progress)?;
 
             // Any changed file that didn't produce chunks (binary,
             // empty, unreadable) also needs a tombstone to suppress
@@ -215,7 +221,7 @@ pub async fn index_repo(
             (infos, ph)
         } else {
             // Full mode: no parent index exists.
-            let infos = chunk_all_files(&repo_cfg.path, &entries, progress)?;
+            let infos = chunk_all_files(&repo_cfg.path, &entries, &commit_hex, progress)?;
             (infos, [0u8; MAX_HASH_LEN])
         };
 
@@ -238,6 +244,7 @@ pub async fn index_repo(
                 &repo,
                 &index_path,
                 &infos,
+                &commit_hex,
                 parent_path,
                 parent_commit_hex,
                 progress,
@@ -331,6 +338,7 @@ pub async fn index_repo(
     let repo_path = repo_cfg.path.to_path_buf();
     let skip_chunks = Arc::new(skip_chunks);
     let skip_chunks_for_producer = Arc::clone(&skip_chunks);
+    let producer_commit_hex = commit_hex.clone();
 
     let producer = std::thread::spawn(move || -> Result<()> {
         let repo = git::open_repo(&repo_path)?;
@@ -344,7 +352,7 @@ pub async fn index_repo(
         for &file_idx in &needs_work {
             let info = &file_infos_for_producer[file_idx];
 
-            let content = match git::read_blob_at_head(&repo, &info.path) {
+            let content = match git::read_blob(&repo, &producer_commit_hex, &info.path) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("  warn: read failed for {}: {}", info.path, e);
@@ -523,9 +531,12 @@ pub async fn index_repo(
 /// Chunk all tracked files to determine index layout. Uses half the
 /// available CPU cores. Returns FileChunkInfo for each non-empty,
 /// non-binary file.
+///
+/// `commit_hex` is the commit hash to read blobs from.
 pub fn chunk_all_files(
     repo_path: &Path,
     entries: &[(usize, String)],
+    commit_hex: &str,
     progress: &dyn IndexProgress,
 ) -> Result<Vec<FileChunkInfo>> {
     let num_threads = std::thread::available_parallelism()
@@ -565,7 +576,7 @@ pub fn chunk_all_files(
                         git::open_repo(&repo_path)
                             .expect("failed to open repo in worker thread")
                     });
-                    git::read_blob_at_head(repo, path).ok()
+                    git::read_blob(repo, commit_hex, path).ok()
                 });
 
                 let content = match content {
@@ -665,6 +676,7 @@ fn prefill_reusable_embeddings(
     repo: &gix::Repository,
     new_index_path: &Path,
     new_file_infos: &[FileChunkInfo],
+    new_commit_hex: &str,
     parent_path: &Path,
     parent_commit_hex: &str,
     progress: &dyn IndexProgress,
@@ -710,7 +722,7 @@ fn prefill_reusable_embeddings(
             Err(_) => continue,
         };
 
-        let new_content = match git::read_blob_at_head(repo, &info.path) {
+        let new_content = match git::read_blob(repo, new_commit_hex, &info.path) {
             Ok(c) => c,
             Err(_) => continue,
         };

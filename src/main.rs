@@ -35,6 +35,10 @@ enum Commands {
         names: Vec<String>,
         #[arg(long)]
         compact: bool,
+        /// Git revision to index at (commit hash, branch name, tag, HEAD~1, etc.).
+        /// Defaults to HEAD when not specified.
+        #[arg(short, long)]
+        commit: Option<String>,
     },
     /// Show indexing status
     Status {
@@ -51,6 +55,10 @@ enum Commands {
         /// Number of results to display
         #[arg(short = 'n', long, default_value_t = 10)]
         top: usize,
+        /// Git revision to search from (commit hash, branch name, tag, HEAD~1, etc.).
+        /// Defaults to HEAD when not specified.
+        #[arg(short, long)]
+        commit: Option<String>,
     },
     /// Create a repository alias
     Alias {
@@ -110,14 +118,14 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Init => cmd_init(),
         Commands::Add { name, path } => cmd_add(&name, &path),
-        Commands::Index { names, compact } => {
+        Commands::Index { names, compact, commit } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(cmd_index(&names, compact))
+            rt.block_on(cmd_index(&names, compact, commit.as_deref()))
         }
         Commands::Status { name } => cmd_status(name.as_deref()),
-        Commands::Search { name, query, top } => {
+        Commands::Search { name, query, top, commit } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(cmd_search(&name, &query, top))
+            rt.block_on(cmd_search(&name, &query, top, commit.as_deref()))
         }
         Commands::Alias { name, repos } => cmd_alias(&name, &repos),
         Commands::Drop { name } => cmd_drop(&name),
@@ -385,7 +393,7 @@ impl IndexProgress for CliProgress {
     }
 }
 
-async fn cmd_index(names: &[String], _compact: bool) -> Result<()> {
+async fn cmd_index(names: &[String], _compact: bool, commit: Option<&str>) -> Result<()> {
     let cfg = config::load_config()?;
     let api_key = cfg
         .voyage_api_key
@@ -399,7 +407,7 @@ async fn cmd_index(names: &[String], _compact: bool) -> Result<()> {
     for repo_name in &repo_names {
         let repo_cfg = resolve_repo(&cfg, repo_name)?;
 
-        ops::index_repo(repo_cfg, &api_key, &progress).await
+        ops::index_repo(repo_cfg, &api_key, &progress, commit).await
             .with_context(|| format!("failed to index '{}'", repo_cfg.name))?;
     }
 
@@ -408,7 +416,7 @@ async fn cmd_index(names: &[String], _compact: bool) -> Result<()> {
 
 // ── kb search ────────────────────────────────────────────────────
 
-async fn cmd_search(name: &str, query: &str, top: usize) -> Result<()> {
+async fn cmd_search(name: &str, query: &str, top: usize, commit: Option<&str>) -> Result<()> {
     let cfg = config::load_config()?;
     let api_key = cfg
         .voyage_api_key
@@ -419,22 +427,30 @@ async fn cmd_search(name: &str, query: &str, top: usize) -> Result<()> {
     let repo_cfg = resolve_repo(&cfg, name)?;
     let repo = git::open_repo(&repo_cfg.path)?;
 
+    // Resolve the commit ref (branch name, tag, hash, HEAD~1, etc.)
+    // to a full hex commit hash. Defaults to HEAD when not specified.
+    let resolved_commit = git::resolve_commit_hex(&repo, commit)?;
+    let ref_label = commit.unwrap_or("HEAD");
+
     let kb_dir = repo_cfg.path.join(".kb");
-    let IndexChain { readers: chain, commits_behind } = load_index_chain(&kb_dir, &repo)?;
+    let IndexChain { readers: chain, commits_behind } =
+        load_index_chain(&kb_dir, &repo, Some(&resolved_commit))?;
 
     let total_embeddings: usize = chain.iter().map(|r| r.embedding_count()).sum();
     eprintln!(
-        "Searching {} ({} index file{}, {} total embeddings)...",
+        "Searching {} at {} ({} index file{}, {} total embeddings)...",
         repo_cfg.name,
+        ref_label,
         chain.len(),
         if chain.len() == 1 { "" } else { "s" },
         total_embeddings,
     );
     if commits_behind > 0 {
         eprintln!(
-            "Note: index is {} commit{} behind HEAD. Run 'kb index' to update.",
+            "Note: index is {} commit{} behind {}. Run 'kb index' to update.",
             commits_behind,
             if commits_behind == 1 { "" } else { "s" },
+            ref_label,
         );
     }
 

@@ -162,6 +162,10 @@ fn handle_tools_list(id: &Value) -> Value {
                                 "type": "integer",
                                 "description": "Number of results to return (default: 10)",
                                 "default": 10
+                            },
+                            "commit": {
+                                "type": "string",
+                                "description": "Git revision to search from (commit hash, branch name, tag, HEAD~1, etc.). Defaults to HEAD when not specified."
                             }
                         },
                         "required": ["name", "query"]
@@ -190,6 +194,10 @@ fn handle_tools_list(id: &Value) -> Value {
                                 "type": "array",
                                 "items": { "type": "string" },
                                 "description": "Repository names to index. If omitted or empty, indexes all registered repositories."
+                            },
+                            "commit": {
+                                "type": "string",
+                                "description": "Git revision to index at (commit hash, branch name, tag, HEAD~1, etc.). Defaults to HEAD when not specified."
                             }
                         }
                     }
@@ -264,6 +272,8 @@ async fn tool_search(args: &Value) -> Result<String> {
     let top = args.get("top")
         .and_then(|v| v.as_u64())
         .unwrap_or(10) as usize;
+    let commit = args.get("commit")
+        .and_then(|v| v.as_str());
 
     let cfg = config::load_config()?;
     let api_key = cfg.voyage_api_key.as_ref()
@@ -273,8 +283,14 @@ async fn tool_search(args: &Value) -> Result<String> {
     let repo_cfg = resolve_repo(&cfg, name)?;
     let repo = git::open_repo(&repo_cfg.path)?;
 
+    // Resolve the commit ref (branch name, tag, hash, HEAD~1, etc.)
+    // to a full hex commit hash. Defaults to HEAD when not specified.
+    let resolved_commit = git::resolve_commit_hex(&repo, commit)?;
+    let ref_label = commit.unwrap_or("HEAD");
+
     let kb_dir = repo_cfg.path.join(".kb");
-    let IndexChain { readers: chain, commits_behind } = load_index_chain(&kb_dir, &repo)?;
+    let IndexChain { readers: chain, commits_behind } =
+        load_index_chain(&kb_dir, &repo, Some(&resolved_commit))?;
 
     let embedder = VoyageEmbedder::new(api_key.clone());
     let query_embedding = embedder.embed_query(query).await?;
@@ -321,9 +337,10 @@ async fn tool_search(args: &Value) -> Result<String> {
 
     if commits_behind > 0 {
         output.push_str(&format!(
-            "Note: index is {} commit{} behind HEAD. Run 'kb index' to update.\n\n",
+            "Note: index is {} commit{} behind {}. Run 'kb index' to update.\n\n",
             commits_behind,
             if commits_behind == 1 { "" } else { "s" },
+            ref_label,
         ));
     }
 
@@ -459,6 +476,8 @@ async fn tool_index(args: &Value) -> Result<String> {
             .collect(),
         None => Vec::new(),
     };
+    let commit = args.get("commit")
+        .and_then(|v| v.as_str());
 
     let repo_names = resolve_names(&cfg, &names)?;
     let progress = StderrProgress;
@@ -467,7 +486,7 @@ async fn tool_index(args: &Value) -> Result<String> {
     for (i, repo_name) in repo_names.iter().enumerate() {
         let repo_cfg = resolve_repo(&cfg, repo_name)?;
 
-        let result = ops::index_repo(repo_cfg, &api_key, &progress).await
+        let result = ops::index_repo(repo_cfg, &api_key, &progress, commit).await
             .map_err(|e| anyhow::anyhow!("failed to index '{}': {:#}", repo_cfg.name, e))?;
 
         if i > 0 {

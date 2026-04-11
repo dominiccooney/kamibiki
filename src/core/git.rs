@@ -14,6 +14,29 @@ pub fn head_commit_hex(repo: &gix::Repository) -> Result<String> {
     Ok(head.id().to_hex().to_string())
 }
 
+/// Resolve a revision spec (commit hash, branch name, HEAD, HEAD~1,
+/// etc.) to a commit hex string. If `spec` is `None`, resolves HEAD.
+///
+/// Uses gitoxide's rev-parse, which supports the same revision
+/// syntax as git itself (hashes, branch names, remote refs, ~N, ^N,
+/// etc.).
+pub fn resolve_commit_hex(repo: &gix::Repository, spec: Option<&str>) -> Result<String> {
+    match spec {
+        None | Some("HEAD") => head_commit_hex(repo),
+        Some(spec) => {
+            let id = repo.rev_parse_single(spec)
+                .with_context(|| format!("failed to resolve revision '{}'", spec))?;
+            // Peel to a commit to ensure the spec actually points at
+            // a commit (not a tree/blob).
+            let commit = id.object()
+                .with_context(|| format!("failed to find object for '{}'", spec))?
+                .try_into_commit()
+                .map_err(|_| anyhow::anyhow!("'{}' does not point to a commit", spec))?;
+            Ok(commit.id().to_hex().to_string())
+        }
+    }
+}
+
 /// Return the entries in the git index (working tree tracked files)
 /// as `(index_position, path)` pairs. The paths are relative to the
 /// repository root.

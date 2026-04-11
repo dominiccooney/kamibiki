@@ -10,12 +10,14 @@ use crate::index::{IndexReader, MmapIndexReader};
 use super::vector_search;
 
 /// The result of loading an index chain: the chain of readers plus
-/// how many commits HEAD is ahead of the nearest indexed commit.
+/// how many commits the starting point is ahead of the nearest
+/// indexed commit.
 pub struct IndexChain {
     /// Index readers ordered newest-first.
     pub readers: Vec<MmapIndexReader>,
-    /// Number of commits HEAD is ahead of the newest index in the
-    /// chain. Zero means the index is at HEAD.
+    /// Number of commits the starting point is ahead of the newest
+    /// index in the chain. Zero means the index matches the
+    /// starting commit.
     pub commits_behind: usize,
 }
 
@@ -125,19 +127,27 @@ pub fn chain_search(
 }
 
 /// Load the chain of index files starting from the most recent
-/// ancestor of HEAD that has been indexed, then walking the
-/// parent hash links. Returns an [`IndexChain`] containing
-/// readers ordered newest-first and the number of commits HEAD
-/// is ahead of the nearest indexed commit.
+/// ancestor of the given commit (or HEAD if `None`) that has been
+/// indexed, then walking the parent hash links. Returns an
+/// [`IndexChain`] containing readers ordered newest-first and the
+/// number of commits the starting point is ahead of the nearest
+/// indexed commit.
 ///
-/// The chain start is found by walking HEAD's git ancestors
-/// (a fast DAG traversal) and checking each commit against the
-/// set of indexed commits (read from .kbi file headers, 65 bytes
-/// each). The chain then follows the parent_hash links embedded
-/// in each index file until a root index or missing parent is
-/// reached.
-pub fn load_index_chain(kb_dir: &Path, repo: &gix::Repository) -> Result<IndexChain> {
-    let (start_path, commits_behind) = find_chain_start(kb_dir, repo)?;
+/// The chain start is found by walking the starting commit's git
+/// ancestors (a fast DAG traversal) and checking each commit
+/// against the set of indexed commits (read from .kbi file
+/// headers, 65 bytes each). The chain then follows the
+/// parent_hash links embedded in each index file until a root
+/// index or missing parent is reached.
+///
+/// `commit_hex` is the resolved commit hash to start from. If
+/// `None`, HEAD is used.
+pub fn load_index_chain(
+    kb_dir: &Path,
+    repo: &gix::Repository,
+    commit_hex: Option<&str>,
+) -> Result<IndexChain> {
+    let (start_path, commits_behind) = find_chain_start(kb_dir, repo, commit_hex)?;
     let readers = walk_index_chain(kb_dir, start_path)?;
     Ok(IndexChain { readers, commits_behind })
 }
@@ -169,18 +179,26 @@ fn walk_index_chain(kb_dir: &Path, start_path: PathBuf) -> Result<Vec<MmapIndexR
     Ok(chain)
 }
 
-/// Find the best starting index by walking HEAD's git ancestors
-/// until we find a commit that has a .kbi file.
+/// Find the best starting index by walking the given commit's (or
+/// HEAD's) git ancestors until we find a commit that has a .kbi
+/// file.
 ///
 /// Returns `(path, commits_behind)` where `commits_behind` is the
-/// number of commits HEAD is ahead of the indexed commit (0 when
-/// the index is at HEAD).
+/// number of commits the starting point is ahead of the indexed
+/// commit (0 when the index matches the starting commit).
+///
+/// `commit_hex` is the resolved commit hash to start from. If
+/// `None`, HEAD is used.
 ///
 /// This reads only the first 65 bytes of each .kbi file (version
 /// byte + commit hash) and walks the git commit DAG, which reads
 /// only small commit objects. Both operations are fast even for
 /// large repositories.
-fn find_chain_start(kb_dir: &Path, repo: &gix::Repository) -> Result<(PathBuf, usize)> {
+fn find_chain_start(
+    kb_dir: &Path,
+    repo: &gix::Repository,
+    commit_hex: Option<&str>,
+) -> Result<(PathBuf, usize)> {
     if !kb_dir.exists() {
         anyhow::bail!(
             "No index directory found at {}. Run 'kb index' first.",
@@ -197,23 +215,34 @@ fn find_chain_start(kb_dir: &Path, repo: &gix::Repository) -> Result<(PathBuf, u
         );
     }
 
-    // Walk HEAD's ancestors (including HEAD itself) to find the
-    // first commit that has an index file.
-    let head = repo.head_commit()
-        .context("failed to resolve HEAD commit")?;
+    // Resolve the starting commit.
+    let start_id = match commit_hex {
+        Some(hex) => {
+            let oid = gix::ObjectId::from_hex(hex.as_bytes())
+                .context("invalid commit hash hex")?;
+            oid
+        }
+        None => {
+            repo.head_commit()
+                .context("failed to resolve HEAD commit")?
+                .id()
+                .into()
+        }
+    };
+    let start_hex = start_id.to_hex().to_string();
 
-    // Check HEAD itself first (fast path — the common case after
-    // running `kb index`).
-    let head_hex = head.id().to_hex().to_string();
-    if let Some(path) = indexed.get(&head_hex) {
+    // Check the starting commit itself first (fast path — the
+    // common case after running `kb index`).
+    if let Some(path) = indexed.get(&start_hex) {
         return Ok((path.clone(), 0));
     }
 
     // Walk ancestors in topological order (newest first).
-    // The rev_walk includes HEAD itself as the first entry, which
-    // we already checked above, so we count each step to track how
-    // many commits HEAD is ahead of the indexed commit.
-    let walk = repo.rev_walk([head.id().detach()])
+    // The rev_walk includes the starting commit itself as the first
+    // entry, which we already checked above, so we count each step
+    // to track how many commits the start is ahead of the indexed
+    // commit.
+    let walk = repo.rev_walk([start_id])
         .all()
         .context("failed to start ancestor walk")?;
 
@@ -223,18 +252,14 @@ fn find_chain_start(kb_dir: &Path, repo: &gix::Repository) -> Result<(PathBuf, u
         let hex = info.id.to_hex().to_string();
         commits_walked += 1;
         if let Some(path) = indexed.get(&hex) {
-            // commits_walked includes HEAD itself (which we already
-            // checked), so the actual distance is commits_walked - 1
-            // for the HEAD entry + the ancestors between HEAD and
-            // the match. But since the walk includes HEAD as entry 1
-            // and each subsequent ancestor adds 1, the distance from
-            // HEAD to this commit is (commits_walked - 1).
             return Ok((path.clone(), commits_walked - 1));
         }
     }
 
+    let ref_label = commit_hex.unwrap_or("HEAD");
     anyhow::bail!(
-        "No indexed ancestor of HEAD found in {}. Run 'kb index' first.",
+        "No indexed ancestor of {} found in {}. Run 'kb index' first.",
+        ref_label,
         kb_dir.display()
     );
 }
