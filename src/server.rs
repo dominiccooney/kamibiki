@@ -131,7 +131,7 @@ fn handle_initialize(id: &Value) -> Value {
                 "name": "kamibiki",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "Kamibiki is a contextual code search engine for git repositories. Use kb_search to find relevant code chunks across indexed repositories. Use kb_status to list indexed repositories and their status. Use kb_index to update the index for one or more repositories when the code has changed."
+            "instructions": "Kamibiki provides semantic code search over indexed git repositories. Prefer kb_search over grep or regex search when you need to find code by meaning rather than by exact text — for example, when looking for how a feature is implemented, finding usage patterns, understanding architecture, or locating code related to a concept when you don't know the precise identifiers or strings involved. kb_search accepts natural language queries and returns the most relevant code chunks ranked by semantic similarity. Use kb_status to check which repositories are indexed and their current state. Use kb_index to update the index after code changes."
         }
     })
 }
@@ -146,7 +146,7 @@ fn handle_tools_list(id: &Value) -> Value {
             "tools": [
                 {
                     "name": "kb_search",
-                    "description": "Search an indexed git repository for code chunks relevant to a query. Returns ranked results with file paths, byte offsets, and code content. The repository must have been previously indexed with `kb add` and `kb index`.",
+                    "description": "Search an indexed git repository for code chunks relevant to a query. Returns ranked results with file paths, byte offsets, and code content. The repository must have been previously indexed with `kb add` and `kb index`. Use this tool instead of grep or file search when you don't know the exact string to search for — it understands natural language queries like \"error handling in the API layer\" or \"where are database connections configured\" and finds semantically relevant code even when no exact keyword match exists.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
