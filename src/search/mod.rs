@@ -1,7 +1,7 @@
-pub mod vector;
-pub mod rerank;
 pub mod chain;
+pub mod rerank;
+pub mod vector;
 
+pub use chain::{ChainSearchResult, IndexChain, chain_search, load_index_chain};
+pub use rerank::{RerankItem, Reranker, VoyageReranker};
 pub use vector::{hamming_distance, vector_search};
-pub use rerank::{VoyageReranker, Reranker, RerankItem};
-pub use chain::{chain_search, load_index_chain, ChainSearchResult, IndexChain};

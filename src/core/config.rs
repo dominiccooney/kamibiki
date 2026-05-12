@@ -5,7 +5,8 @@ use super::types::KbConfig;
 
 /// Return the path to the configuration file (~/.kb.conf).
 pub fn config_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
     Ok(home.join(".kb.conf"))
 }
 

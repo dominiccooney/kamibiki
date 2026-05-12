@@ -1,9 +1,9 @@
+pub mod compact;
 pub mod format;
 pub mod mmap;
-pub mod compact;
 
-use anyhow::Result;
 use crate::core::types::{BinaryEmbedding, ChunkRef, GitHash, IndexHeader};
+use anyhow::Result;
 
 /// Trait for reading index files (object-safe for dynamic dispatch).
 pub trait IndexReader {
@@ -61,5 +61,8 @@ impl FileChunkInfo {
 }
 
 // Re-exports for convenience.
-pub use format::{write_index, write_skeleton, index_layout, detect_incomplete, write_embeddings_at, write_embeddings_scattered, read_file_infos, IndexLayout};
+pub use format::{
+    IndexLayout, detect_incomplete, index_layout, read_file_infos, write_embeddings_at,
+    write_embeddings_scattered, write_index, write_skeleton,
+};
 pub use mmap::MmapIndexReader;

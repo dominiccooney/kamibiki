@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 
+use super::vector_search;
 use crate::core::git;
 use crate::core::types::*;
 use crate::index::{IndexReader, MmapIndexReader};
-use super::vector_search;
 
 /// The result of loading an index chain: the chain of readers plus
 /// how many commits the starting point is ahead of the nearest
@@ -107,10 +107,7 @@ pub fn chain_search(
                     shadowed_paths.extend(diff.deleted);
                 }
                 Err(e) => {
-                    eprintln!(
-                        "  warn: could not compute diff for shadowing: {}",
-                        e
-                    );
+                    eprintln!("  warn: could not compute diff for shadowing: {}", e);
                     // If we can't compute the diff, conservatively
                     // continue without shadowing. This means some
                     // stale results might appear, but we won't lose
@@ -149,7 +146,10 @@ pub fn load_index_chain(
 ) -> Result<IndexChain> {
     let (start_path, commits_behind) = find_chain_start(kb_dir, repo, commit_hex)?;
     let readers = walk_index_chain(kb_dir, start_path)?;
-    Ok(IndexChain { readers, commits_behind })
+    Ok(IndexChain {
+        readers,
+        commits_behind,
+    })
 }
 
 /// Walk a chain of indexes from a starting .kbi file, following
@@ -218,16 +218,14 @@ fn find_chain_start(
     // Resolve the starting commit.
     let start_id = match commit_hex {
         Some(hex) => {
-            let oid = gix::ObjectId::from_hex(hex.as_bytes())
-                .context("invalid commit hash hex")?;
+            let oid = gix::ObjectId::from_hex(hex.as_bytes()).context("invalid commit hash hex")?;
             oid
         }
-        None => {
-            repo.head_commit()
-                .context("failed to resolve HEAD commit")?
-                .id()
-                .into()
-        }
+        None => repo
+            .head_commit()
+            .context("failed to resolve HEAD commit")?
+            .id()
+            .into(),
     };
     let start_hex = start_id.to_hex().to_string();
 
@@ -242,7 +240,8 @@ fn find_chain_start(
     // entry, which we already checked above, so we count each step
     // to track how many commits the start is ahead of the indexed
     // commit.
-    let walk = repo.rev_walk([start_id])
+    let walk = repo
+        .rev_walk([start_id])
         .all()
         .context("failed to start ancestor walk")?;
 
@@ -293,7 +292,10 @@ fn read_commit_hash_from_header(path: &Path) -> Result<String> {
     file.read_exact(&mut buf)?;
     // commit_hash starts at byte 1 (after version byte).
     let hash_bytes = &buf[1..];
-    let end = hash_bytes.iter().position(|&b| b == 0).unwrap_or(MAX_HASH_LEN);
+    let end = hash_bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(MAX_HASH_LEN);
     Ok(String::from_utf8_lossy(&hash_bytes[..end]).into_owned())
 }
 
@@ -378,10 +380,7 @@ mod tests {
 
         let chain = walk_index_chain(kb_dir, start).unwrap();
         assert_eq!(chain.len(), 1);
-        assert_eq!(
-            commit_hash_to_hex(&chain[0].header().commit_hash),
-            "aaaa"
-        );
+        assert_eq!(commit_hash_to_hex(&chain[0].header().commit_hash), "aaaa");
     }
 
     #[test]
@@ -417,14 +416,8 @@ mod tests {
         let chain = walk_index_chain(kb_dir, start).unwrap();
         assert_eq!(chain.len(), 2);
         // Newest first
-        assert_eq!(
-            commit_hash_to_hex(&chain[0].header().commit_hash),
-            "bbbb"
-        );
-        assert_eq!(
-            commit_hash_to_hex(&chain[1].header().commit_hash),
-            "aaaa"
-        );
+        assert_eq!(commit_hash_to_hex(&chain[0].header().commit_hash), "bbbb");
+        assert_eq!(commit_hash_to_hex(&chain[1].header().commit_hash), "aaaa");
     }
 
     #[test]
@@ -468,11 +461,7 @@ mod tests {
         let kb_dir = dir.path();
 
         let header = make_header("abcdef1234567890extra", "");
-        write_index(
-            &kb_dir.join("abcdef1234567890.kbi"),
-            &header,
-            &[],
-        ).unwrap();
+        write_index(&kb_dir.join("abcdef1234567890.kbi"), &header, &[]).unwrap();
 
         let found = find_index_by_commit(kb_dir, "abcdef1234567890extra");
         assert!(found.is_some());
@@ -496,16 +485,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let kb_dir = dir.path();
 
-        write_index(
-            &kb_dir.join("aaaa.kbi"),
-            &make_header("aaaa1111", ""),
-            &[],
-        ).unwrap();
+        write_index(&kb_dir.join("aaaa.kbi"), &make_header("aaaa1111", ""), &[]).unwrap();
         write_index(
             &kb_dir.join("bbbb.kbi"),
             &make_header("bbbb2222", "aaaa1111"),
             &[],
-        ).unwrap();
+        )
+        .unwrap();
 
         let indexed = scan_indexed_commits(kb_dir).unwrap();
         assert_eq!(indexed.len(), 2);

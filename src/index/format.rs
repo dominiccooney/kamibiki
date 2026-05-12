@@ -2,8 +2,10 @@ use std::path::Path;
 
 use anyhow::{Result, ensure};
 
-use crate::core::types::{BinaryEmbedding, IndexHeader, EMBEDDING_ALIGNMENT, EMBEDDING_BYTES, MAX_HASH_LEN};
-use super::{FileEntry, FileChunkInfo};
+use super::{FileChunkInfo, FileEntry};
+use crate::core::types::{
+    BinaryEmbedding, EMBEDDING_ALIGNMENT, EMBEDDING_BYTES, IndexHeader, MAX_HASH_LEN,
+};
 
 /// Size of the serialized header: version(1) + commit_hash(64) + parent_hash(64).
 pub const HEADER_SIZE: usize = 1 + MAX_HASH_LEN + MAX_HASH_LEN;
@@ -232,8 +234,7 @@ pub fn index_layout(data: &[u8]) -> Result<IndexLayout> {
     pos += total_chunks * 2;
 
     // Compute embeddings offset (aligned).
-    let embeddings_offset =
-        (pos + EMBEDDING_ALIGNMENT - 1) & !(EMBEDDING_ALIGNMENT - 1);
+    let embeddings_offset = (pos + EMBEDDING_ALIGNMENT - 1) & !(EMBEDDING_ALIGNMENT - 1);
 
     Ok(IndexLayout {
         embeddings_offset,
@@ -314,10 +315,7 @@ pub fn write_embeddings_scattered(
 /// file's metadata, using git index entries to resolve file paths.
 /// This avoids re-chunking the entire repository when resuming
 /// an incomplete index.
-pub fn read_file_infos(
-    data: &[u8],
-    git_entries: &[(usize, String)],
-) -> Result<Vec<FileChunkInfo>> {
+pub fn read_file_infos(data: &[u8], git_entries: &[(usize, String)]) -> Result<Vec<FileChunkInfo>> {
     ensure!(data.len() >= HEADER_SIZE, "index file too small");
 
     let (positions, ot_bytes) = decode_offset_table(&data[HEADER_SIZE..])?;
@@ -356,18 +354,31 @@ pub fn read_file_infos(
         }
         pos += count * 2;
 
-        let path = pos_to_path
-            .get(&positions[i])
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "git index position {} not found in current git index",
-                    positions[i]
-                )
-            })?;
+        // Tombstone entries (delta deletions / unchunked files) are
+        // written with synthetic positions past the end of the tree
+        // they were produced for, so they may not appear in the
+        // current entries list. That's fine because they carry no
+        // chunks and contribute no work on resume — we just keep the
+        // layout slot intact with an empty path.
+        //
+        // A position that is unknown *and* carries chunks indicates a
+        // truly stale skeleton (file set differs from what was
+        // indexed); that remains an error.
+        let path = match pos_to_path.get(&positions[i]) {
+            Some(p) => p.to_string(),
+            None if count == 0 => String::new(),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "git index position {} (with {} chunks) not found in current git index",
+                    positions[i],
+                    count,
+                ));
+            }
+        };
 
         file_infos.push(FileChunkInfo {
             git_index_position: positions[i],
-            path: path.to_string(),
+            path,
             chunk_lengths: lengths,
         });
     }
@@ -437,8 +448,14 @@ mod tests {
     #[test]
     fn offset_table_leading_gap() {
         let entries = vec![
-            FileEntry { git_index_position: 5, chunks: vec![] },
-            FileEntry { git_index_position: 6, chunks: vec![] },
+            FileEntry {
+                git_index_position: 5,
+                chunks: vec![],
+            },
+            FileEntry {
+                git_index_position: 6,
+                chunks: vec![],
+            },
         ];
         let mut buf = Vec::new();
         encode_offset_table(&mut buf, &entries);
@@ -449,8 +466,14 @@ mod tests {
     #[test]
     fn offset_table_large_gap() {
         let entries = vec![
-            FileEntry { git_index_position: 0, chunks: vec![] },
-            FileEntry { git_index_position: 40000, chunks: vec![] },
+            FileEntry {
+                git_index_position: 0,
+                chunks: vec![],
+            },
+            FileEntry {
+                git_index_position: 40000,
+                chunks: vec![],
+            },
         ];
         let mut buf = Vec::new();
         encode_offset_table(&mut buf, &entries);
@@ -527,8 +550,14 @@ mod tests {
     fn unsorted_entries_rejected() {
         let header = make_header();
         let entries = vec![
-            FileEntry { git_index_position: 5, chunks: vec![] },
-            FileEntry { git_index_position: 2, chunks: vec![] },
+            FileEntry {
+                git_index_position: 5,
+                chunks: vec![],
+            },
+            FileEntry {
+                git_index_position: 2,
+                chunks: vec![],
+            },
         ];
         assert!(encode_index(&header, &entries).is_err());
     }
@@ -537,8 +566,14 @@ mod tests {
     fn duplicate_positions_rejected() {
         let header = make_header();
         let entries = vec![
-            FileEntry { git_index_position: 3, chunks: vec![] },
-            FileEntry { git_index_position: 3, chunks: vec![] },
+            FileEntry {
+                git_index_position: 3,
+                chunks: vec![],
+            },
+            FileEntry {
+                git_index_position: 3,
+                chunks: vec![],
+            },
         ];
         assert!(encode_index(&header, &entries).is_err());
     }
@@ -607,13 +642,11 @@ mod tests {
         // Simulate delta indexing where some chunks in a file are
         // pre-filled (reused from parent) and others are still zero.
         let header = make_header();
-        let file_infos = vec![
-            FileChunkInfo {
-                git_index_position: 0,
-                path: "a.rs".to_string(),
-                chunk_lengths: vec![100, 50, 75],
-            },
-        ];
+        let file_infos = vec![FileChunkInfo {
+            git_index_position: 0,
+            path: "a.rs".to_string(),
+            chunk_lengths: vec![100, 50, 75],
+        }];
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.kbi");
@@ -657,18 +690,84 @@ mod tests {
     }
 
     #[test]
+    fn read_file_infos_tolerates_tombstone_positions() {
+        // Simulate a delta skeleton that includes a tombstone with a
+        // synthetic position past the end of the current git entries.
+        // On resume with fewer entries, the tombstone's position is
+        // unknown to the lookup — but since it has zero chunks, it
+        // must still reload successfully.
+        let header = make_header();
+        let file_infos = vec![
+            FileChunkInfo {
+                git_index_position: 0,
+                path: "alive.rs".to_string(),
+                chunk_lengths: vec![100],
+            },
+            FileChunkInfo {
+                git_index_position: 2006,
+                path: "deleted.rs".to_string(),
+                chunk_lengths: vec![], // tombstone
+            },
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delta.kbi");
+        write_skeleton(&path, &header, &file_infos).unwrap();
+
+        // Current tree has only the alive file — deleted.rs isn't here,
+        // and position 2006 is past the end.
+        let current_entries = vec![(0, "alive.rs".to_string())];
+        let data = std::fs::read(&path).unwrap();
+
+        let reloaded = read_file_infos(&data, &current_entries).unwrap();
+        assert_eq!(reloaded.len(), 2);
+        assert_eq!(reloaded[0].path, "alive.rs");
+        assert_eq!(reloaded[0].chunk_lengths, vec![100]);
+        // Tombstone round-trips with an empty path (unknown in tree),
+        // preserving the layout slot for correct embedding offsets.
+        assert_eq!(reloaded[1].chunk_lengths, Vec::<u16>::new());
+        assert_eq!(reloaded[1].git_index_position, 2006);
+    }
+
+    #[test]
+    fn read_file_infos_rejects_stale_positions_with_chunks() {
+        // A non-tombstone entry with an unknown position is a real
+        // skeleton/tree mismatch and must still error.
+        let header = make_header();
+        let file_infos = vec![FileChunkInfo {
+            git_index_position: 9999,
+            path: "mystery.rs".to_string(),
+            chunk_lengths: vec![100, 50],
+        }];
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.kbi");
+        write_skeleton(&path, &header, &file_infos).unwrap();
+
+        let current_entries = vec![(0, "other.rs".to_string())];
+        let data = std::fs::read(&path).unwrap();
+
+        let result = read_file_infos(&data, &current_entries);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("9999") && msg.contains("2 chunks"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
     fn index_layout_matches_mmap_reader() {
         let header = make_header();
         let entries = vec![
             FileEntry {
                 git_index_position: 0,
-                chunks: vec![
-                    ChunkEntry {
-                        byte_offset: 0,
-                        chunk_len: 100,
-                        embedding: make_embedding(0xAA),
-                    },
-                ],
+                chunks: vec![ChunkEntry {
+                    byte_offset: 0,
+                    chunk_len: 100,
+                    embedding: make_embedding(0xAA),
+                }],
             },
             FileEntry {
                 git_index_position: 5,

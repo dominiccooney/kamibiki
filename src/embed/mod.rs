@@ -1,7 +1,7 @@
 pub mod voyage;
 
-use anyhow::Result;
 use crate::core::types::BinaryEmbedding;
+use anyhow::Result;
 
 pub use voyage::VoyageEmbedder;
 pub use voyage::{MAX_INPUTS_PER_REQUEST, MAX_REQUEST_TOKENS};

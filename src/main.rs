@@ -9,10 +9,11 @@ use kb::core::config;
 use kb::core::git;
 use kb::core::types::*;
 use kb::embed::{Embedder, VoyageEmbedder};
-use kb::snippet;
-use kb::index::{MmapIndexReader, IndexReader};
+use kb::gc;
+use kb::index::{IndexReader, MmapIndexReader};
 use kb::ops::{self, IndexProgress};
-use kb::search::{Reranker, VoyageReranker, chain_search, load_index_chain, IndexChain};
+use kb::search::{IndexChain, Reranker, VoyageReranker, chain_search, load_index_chain};
+use kb::snippet;
 
 #[derive(Parser)]
 #[command(name = "kb", about = "Kamibiki - contextual search for git repos")]
@@ -26,24 +27,24 @@ enum Commands {
     /// Set up Voyage AI key
     Init,
     /// Add a repository to the index
-    Add {
-        name: String,
-        path: String,
-    },
+    Add { name: String, path: String },
     /// Update the index for one or more repositories
     Index {
         names: Vec<String>,
+        /// Write a self-contained root index (parent hash zero) by
+        /// re-chunking every tracked file. Discards any existing
+        /// delta at the same commit. Chain walks will terminate at
+        /// the resulting index.
         #[arg(long)]
         compact: bool,
+
         /// Git revision to index at (commit hash, branch name, tag, HEAD~1, etc.).
         /// Defaults to HEAD when not specified.
         #[arg(short, long)]
         commit: Option<String>,
     },
     /// Show indexing status
-    Status {
-        name: Option<String>,
-    },
+    Status { name: Option<String> },
     /// Start the MCP server on stdio
     Start,
     /// Stop the server (not yet implemented)
@@ -61,13 +62,22 @@ enum Commands {
         commit: Option<String>,
     },
     /// Create a repository alias
-    Alias {
-        name: String,
-        repos: Vec<String>,
-    },
+    Alias { name: String, repos: Vec<String> },
     /// Drop (delete) all index files for a repository
-    Drop {
-        name: String,
+    Drop { name: String },
+    /// Garbage-collect index files for commits no longer known to git.
+    ///
+    /// Walks the `.kb/` directory for each repository (or just one
+    /// when a name is given) and deletes any `.kbi` whose indexed
+    /// commit hash no longer resolves in git. As a consistency
+    /// check, warns when a surviving index points at a deleted
+    /// parent index — a situation that should not normally arise.
+    Gc {
+        /// Repository name (or '.' for current). Omit to gc all repos.
+        name: Option<String>,
+        /// Show what would be deleted without actually removing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Debug / diagnostic subcommands
     Debug {
@@ -118,18 +128,29 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Init => cmd_init(),
         Commands::Add { name, path } => cmd_add(&name, &path),
-        Commands::Index { names, compact, commit } => {
+        Commands::Index {
+            names,
+            compact,
+            commit,
+        } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(cmd_index(&names, compact, commit.as_deref()))
         }
         Commands::Status { name } => cmd_status(name.as_deref()),
-        Commands::Search { name, query, top, commit } => {
+        Commands::Search {
+            name,
+            query,
+            top,
+            commit,
+        } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(cmd_search(&name, &query, top, commit.as_deref()))
         }
         Commands::Alias { name, repos } => cmd_alias(&name, &repos),
         Commands::Drop { name } => cmd_drop(&name),
+        Commands::Gc { name, dry_run } => cmd_gc(name.as_deref(), dry_run),
         Commands::Start => kb::server::run_mcp_server(),
+
         Commands::Stop => {
             eprintln!("Server mode not yet implemented.");
             Ok(())
@@ -170,11 +191,19 @@ fn cmd_init() -> Result<()> {
 // ── kb add ───────────────────────────────────────────────────────
 
 fn cmd_add(name: &str, path: &str) -> Result<()> {
-    let abs_path = std::fs::canonicalize(path)
-        .with_context(|| format!("path does not exist: {}", path))?;
+    let abs_path =
+        std::fs::canonicalize(path).with_context(|| format!("path does not exist: {}", path))?;
 
-    git::open_repo(&abs_path)
+    let repo = git::open_repo(&abs_path)
         .with_context(|| format!("{} is not a git repository", abs_path.display()))?;
+
+    // If the user pointed at a linked worktree, resolve to the main
+    // worktree so the registered path is stable across worktrees and
+    // the shared `.kb/` lives alongside the canonical `.git/`.
+    let main_path = git::main_worktree_path(&repo).ok_or_else(|| {
+        anyhow::anyhow!("bare repository not supported (provide the path to a checkout)")
+    })?;
+    let main_path = std::fs::canonicalize(&main_path).unwrap_or(main_path);
 
     let mut cfg = config::load_config()?;
 
@@ -182,16 +211,24 @@ fn cmd_add(name: &str, path: &str) -> Result<()> {
         anyhow::bail!("repository '{}' already exists in config", name);
     }
 
-    let kb_dir = abs_path.join(".kb");
+    let kb_dir = main_path.join(".kb");
     std::fs::create_dir_all(&kb_dir)?;
+
+    if main_path != abs_path {
+        eprintln!(
+            "Note: '{}' is a linked worktree of '{}'. Registering the main worktree.",
+            abs_path.display(),
+            main_path.display(),
+        );
+    }
 
     cfg.repos.push(RepoConfig {
         name: name.to_string(),
-        path: abs_path.clone(),
+        path: main_path.clone(),
     });
     config::save_config(&cfg)?;
 
-    eprintln!("Added repository '{}' at {}", name, abs_path.display());
+    eprintln!("Added repository '{}' at {}", name, main_path.display());
     Ok(())
 }
 
@@ -216,6 +253,20 @@ fn cmd_status(name: Option<&str>) -> Result<()> {
     for repo in repos {
         println!("Repository: {} ({})", repo.name, repo.path.display());
 
+        // List worktrees. A single `.kb/` serves all worktrees, but
+        // listing them helps users see which checkouts exist.
+        if let Ok(opened) = git::open_repo(&repo.path) {
+            if let Ok(worktrees) = git::list_worktrees(&opened) {
+                let linked: Vec<_> = worktrees.iter().filter(|w| !w.is_main).collect();
+                if !linked.is_empty() {
+                    println!("  Worktrees:");
+                    for wt in &worktrees {
+                        println!("    {}: {}", wt.label(), wt.path.display());
+                    }
+                }
+            }
+        }
+
         let kb_dir = repo.path.join(".kb");
         if !kb_dir.exists() {
             println!("  Status: not indexed");
@@ -224,11 +275,7 @@ fn cmd_status(name: Option<&str>) -> Result<()> {
 
         let mut kbi_files: Vec<_> = std::fs::read_dir(&kb_dir)?
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .is_some_and(|ext| ext == "kbi")
-            })
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "kbi"))
             .collect();
 
         if kbi_files.is_empty() {
@@ -393,7 +440,7 @@ impl IndexProgress for CliProgress {
     }
 }
 
-async fn cmd_index(names: &[String], _compact: bool, commit: Option<&str>) -> Result<()> {
+async fn cmd_index(names: &[String], compact: bool, commit: Option<&str>) -> Result<()> {
     let cfg = config::load_config()?;
     let api_key = cfg
         .voyage_api_key
@@ -405,13 +452,152 @@ async fn cmd_index(names: &[String], _compact: bool, commit: Option<&str>) -> Re
     let progress = CliProgress::new();
 
     for repo_name in &repo_names {
-        let repo_cfg = resolve_repo(&cfg, repo_name)?;
+        let (repo_cfg, worktree_path) = resolve_repo_and_worktree(&cfg, repo_name)?;
 
-        ops::index_repo(repo_cfg, &api_key, &progress, commit).await
-            .with_context(|| format!("failed to index '{}'", repo_cfg.name))?;
+        ops::index_repo(
+            repo_cfg,
+            &worktree_path,
+            &api_key,
+            &progress,
+            commit,
+            compact,
+        )
+        .await
+        .with_context(|| format!("failed to index '{}'", repo_cfg.name))?;
     }
 
     Ok(())
+}
+
+// ── kb gc ────────────────────────────────────────────────────────
+//
+// Walks each repo's `.kb/` directory, deletes index files whose
+// indexed commit is no longer known to git, and warns about the
+// anomalous (but not fatal) case of a surviving file pointing at a
+// deleted parent index.
+
+fn cmd_gc(name: Option<&str>, dry_run: bool) -> Result<()> {
+    let cfg = config::load_config()?;
+
+    let targets: Vec<(String, std::path::PathBuf)> = match name {
+        Some(".") => {
+            let (repo_cfg, _) = resolve_repo_and_worktree(&cfg, ".")?;
+            vec![(repo_cfg.name.clone(), repo_cfg.path.clone())]
+        }
+        Some(n) => {
+            let repo_cfg = cfg
+                .repos
+                .iter()
+                .find(|r| r.name == n)
+                .ok_or_else(|| anyhow::anyhow!("unknown repository: '{}'", n))?;
+            vec![(repo_cfg.name.clone(), repo_cfg.path.clone())]
+        }
+        None => cfg
+            .repos
+            .iter()
+            .map(|r| (r.name.clone(), r.path.clone()))
+            .collect(),
+    };
+
+    if targets.is_empty() {
+        eprintln!("No repositories configured.");
+        return Ok(());
+    }
+
+    let mut grand_total_deleted: usize = 0;
+    let mut grand_total_bytes: u64 = 0;
+    let mut had_warnings = false;
+
+    for (repo_name, repo_path) in &targets {
+        let kb_dir = repo_path.join(".kb");
+        if !kb_dir.exists() {
+            continue;
+        }
+
+        // Open the repo to drive liveness checks. Failure to open
+        // is reported but doesn't abort remaining repos.
+        let repo = match git::open_repo(repo_path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("  warn: cannot open {}: {}", repo_path.display(), e);
+                continue;
+            }
+        };
+
+        let plan = gc::plan_gc(&kb_dir, |c| gc::commit_is_known(&repo, c))?;
+
+        println!("Repository: {} ({})", repo_name, repo_path.display());
+
+        // Surface anomalies first so they're easy to notice.
+        for w in &plan.warnings {
+            had_warnings = true;
+            eprintln!(
+                "  warning: {} (commit {}) points at parent {} which is being deleted — \
+                 chain walks from this index will no longer find the parent.",
+                w.child_path.display(),
+                short_hex(&w.child_commit_hex),
+                short_hex(&w.parent_commit_hex),
+            );
+        }
+
+        if plan.to_delete.is_empty() {
+            println!(
+                "  Nothing to collect ({} index file{} kept).",
+                plan.kept.len(),
+                if plan.kept.len() == 1 { "" } else { "s" }
+            );
+            continue;
+        }
+
+        println!(
+            "  {} {} index file{} ({}):",
+            if dry_run { "Would delete" } else { "Deleting" },
+            plan.to_delete.len(),
+            if plan.to_delete.len() == 1 { "" } else { "s" },
+            format_bytes(plan.bytes_freed()),
+        );
+        for entry in &plan.to_delete {
+            let commit = if entry.commit_hex.is_empty() {
+                "<unreadable>".to_string()
+            } else {
+                short_hex(&entry.commit_hex)
+            };
+            println!(
+                "    {} (commit {}, {})",
+                entry.path.display(),
+                commit,
+                format_bytes(entry.size)
+            );
+        }
+
+        if !dry_run {
+            let freed = gc::execute(&plan)?;
+            grand_total_deleted += plan.to_delete.len();
+            grand_total_bytes += freed;
+        }
+    }
+
+    if !dry_run && grand_total_deleted > 0 {
+        eprintln!(
+            "Reclaimed {} across {} index file{}.",
+            format_bytes(grand_total_bytes),
+            grand_total_deleted,
+            if grand_total_deleted == 1 { "" } else { "s" },
+        );
+    }
+
+    if had_warnings {
+        eprintln!(
+            "Consistency warnings reported above. Searches that rely on the warned \
+             parent chain may produce reduced results."
+        );
+    }
+
+    Ok(())
+}
+
+fn short_hex(hex: &str) -> String {
+    hex[..hex.len().min(12)].to_string()
 }
 
 // ── kb search ────────────────────────────────────────────────────
@@ -424,17 +610,24 @@ async fn cmd_search(name: &str, query: &str, top: usize, commit: Option<&str>) -
         .ok_or_else(|| anyhow::anyhow!("No Voyage API key configured. Run 'kb init' first."))?
         .clone();
 
-    let repo_cfg = resolve_repo(&cfg, name)?;
-    let repo = git::open_repo(&repo_cfg.path)?;
+    let (repo_cfg, worktree_path) = resolve_repo_and_worktree(&cfg, name)?;
+    // Open the git repo from the current worktree so HEAD resolves
+    // to the worktree's HEAD (may differ from the main worktree for
+    // linked worktrees).
+    let repo = git::open_repo(&worktree_path)?;
 
     // Resolve the commit ref (branch name, tag, hash, HEAD~1, etc.)
     // to a full hex commit hash. Defaults to HEAD when not specified.
     let resolved_commit = git::resolve_commit_hex(&repo, commit)?;
     let ref_label = commit.unwrap_or("HEAD");
 
+    // The shared `.kb/` always lives at the main (registered) path.
     let kb_dir = repo_cfg.path.join(".kb");
-    let IndexChain { readers: chain, commits_behind } =
-        load_index_chain(&kb_dir, &repo, Some(&resolved_commit))?;
+
+    let IndexChain {
+        readers: chain,
+        commits_behind,
+    } = load_index_chain(&kb_dir, &repo, Some(&resolved_commit))?;
 
     let total_embeddings: usize = chain.iter().map(|r| r.embedding_count()).sum();
     eprintln!(
@@ -458,12 +651,7 @@ async fn cmd_search(name: &str, query: &str, top: usize, commit: Option<&str>) -
     let query_embedding = embedder.embed_query(query).await?;
 
     let vector_top_n = 200;
-    let vector_results = chain_search(
-        &chain,
-        &repo,
-        &query_embedding,
-        vector_top_n,
-    )?;
+    let vector_results = chain_search(&chain, &repo, &query_embedding, vector_top_n)?;
 
     if vector_results.is_empty() {
         eprintln!("No results found.");
@@ -477,8 +665,7 @@ async fn cmd_search(name: &str, query: &str, top: usize, commit: Option<&str>) -
     let mut chunk_start_lines: Vec<usize> = Vec::new();
 
     for result in &vector_results {
-        let content = git::read_blob(&repo, &result.commit_hex, &result.path)
-            .unwrap_or_default();
+        let content = git::read_blob(&repo, &result.commit_hex, &result.path).unwrap_or_default();
 
         let offset = result.byte_offset as usize;
         let len = result.chunk_len as usize;
@@ -519,13 +706,17 @@ async fn cmd_search(name: &str, query: &str, top: usize, commit: Option<&str>) -
             byte_len,
             item.relevance_score
         )?;
+        // Staleness compares against the file on disk in the
+        // worktree the user is searching from (which may differ
+        // from the main worktree for linked worktrees).
         let staleness = git::check_snippet_staleness(
-            &repo_cfg.path,
+            &worktree_path,
             path,
             byte_offset as usize,
             byte_len as usize,
             content.as_bytes(),
         );
+
         if let Some(note) = staleness.note() {
             writeln!(out, "{}", note)?;
         }
@@ -584,11 +775,7 @@ fn cmd_drop(name: &str) -> Result<()> {
 
     let kbi_files: Vec<_> = std::fs::read_dir(&kb_dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "kbi")
-        })
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "kbi"))
         .collect();
 
     if kbi_files.is_empty() {
@@ -621,8 +808,8 @@ fn cmd_drop(name: &str) -> Result<()> {
 // ── kb debug files ───────────────────────────────────────────────
 
 fn cmd_debug_files(path: &str) -> Result<()> {
-    let repo_path = std::fs::canonicalize(path)
-        .with_context(|| format!("path does not exist: {}", path))?;
+    let repo_path =
+        std::fs::canonicalize(path).with_context(|| format!("path does not exist: {}", path))?;
     let repo = git::open_repo(&repo_path)?;
     let commit_hex = git::head_commit_hex(&repo)?;
     let entries = git::index_entries(&repo)?;
@@ -654,7 +841,11 @@ fn cmd_debug_files(path: &str) -> Result<()> {
     println!("HEAD: {}", &commit_hex[..commit_hex.len().min(12)]);
     println!("Tracked files: {}", entries.len());
     println!("Files passing filter: {}", file_count);
-    println!("Total bytes: {} ({})", total_bytes, format_bytes(total_bytes));
+    println!(
+        "Total bytes: {} ({})",
+        total_bytes,
+        format_bytes(total_bytes)
+    );
     if skipped > 0 {
         println!("Skipped (binary): {}", skipped);
     }
@@ -736,13 +927,10 @@ fn print_chunks(
         write!(out, "{}", numbered)?;
     }
 
-    if chunks
-        .last()
-        .is_some_and(|c| {
-            let end = c.byte_offset + c.len;
-            end > 0 && content[end - 1] != b'\n'
-        })
-    {
+    if chunks.last().is_some_and(|c| {
+        let end = c.byte_offset + c.len;
+        end > 0 && content[end - 1] != b'\n'
+    }) {
         writeln!(out)?;
     }
 
@@ -751,31 +939,61 @@ fn print_chunks(
 
 // ── Helpers ──────────────────────────────────────────────────────
 
+/// Resolve a repo name to its registered config. When `name == "."`,
+/// the current directory's main worktree is used for matching — so
+/// `.` works from any linked worktree as long as the underlying repo
+/// is registered.
 fn resolve_repo<'a>(cfg: &'a KbConfig, name: &str) -> Result<&'a RepoConfig> {
+    let (cfg_ref, _) = resolve_repo_and_worktree(cfg, name)?;
+    Ok(cfg_ref)
+}
+
+/// Resolve a repo name to both its registered config and the current
+/// worktree path to use for git operations.
+///
+/// * For a named repo: worktree_path is `repo_cfg.path` (the main
+///   worktree).
+/// * For `.`: worktree_path is the current working directory's
+///   worktree — which may be a linked worktree. The registered repo
+///   is found by matching the main worktree path.
+fn resolve_repo_and_worktree<'a>(
+    cfg: &'a KbConfig,
+    name: &str,
+) -> Result<(&'a RepoConfig, std::path::PathBuf)> {
     if name == "." {
         let cwd = std::env::current_dir()?;
         let repo = git::open_repo(&cwd)?;
-        let repo_root = repo
+        let current_workdir = repo
             .workdir()
+            .ok_or_else(|| anyhow::anyhow!("bare repository not supported"))?
+            .to_path_buf();
+        let current_workdir = std::fs::canonicalize(&current_workdir).unwrap_or(current_workdir);
+        let main_path = git::main_worktree_path(&repo)
             .ok_or_else(|| anyhow::anyhow!("bare repository not supported"))?;
-        let canon = std::fs::canonicalize(repo_root)?;
-        cfg.repos
+        let main_canon = std::fs::canonicalize(&main_path).unwrap_or(main_path);
+
+        let repo_cfg = cfg
+            .repos
             .iter()
             .find(|r| {
                 std::fs::canonicalize(&r.path)
-                    .map(|p| p == canon)
+                    .map(|p| p == main_canon)
                     .unwrap_or(false)
             })
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "current directory's repository is not registered. Use 'kb add' first."
                 )
-            })
+            })?;
+
+        Ok((repo_cfg, current_workdir))
     } else {
-        cfg.repos
+        let repo_cfg = cfg
+            .repos
             .iter()
             .find(|r| r.name == name)
-            .ok_or_else(|| anyhow::anyhow!("unknown repository: '{}'", name))
+            .ok_or_else(|| anyhow::anyhow!("unknown repository: '{}'", name))?;
+        Ok((repo_cfg, repo_cfg.path.clone()))
     }
 }
 
@@ -811,4 +1029,3 @@ fn commit_hash_to_hex(hash: &GitHash) -> String {
     let end = hash.iter().position(|&b| b == 0).unwrap_or(hash.len());
     String::from_utf8_lossy(&hash[..end]).into_owned()
 }
-

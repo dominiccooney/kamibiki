@@ -1,15 +1,163 @@
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use gix::bstr::ByteSlice;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Open a git repository at the given path.
 pub fn open_repo(path: &Path) -> Result<gix::Repository> {
     Ok(gix::discover(path)?)
 }
 
+// ── Worktree support ────────────────────────────────────────────
+
+/// Identifies a worktree (main or linked) within a repository.
+///
+/// `id` is empty for the main worktree; for a linked worktree it is
+/// the basename of `.git/worktrees/<id>/` (the worktree's name as
+/// recorded by git). `path` is the absolute path of the working
+/// directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeInfo {
+    /// Worktree identifier. Empty string for the main worktree.
+    pub id: String,
+    /// Absolute path to the worktree's working directory.
+    pub path: PathBuf,
+    /// True for the main worktree, false for linked worktrees.
+    pub is_main: bool,
+}
+
+impl WorktreeInfo {
+    pub fn main(path: PathBuf) -> Self {
+        Self {
+            id: String::new(),
+            path,
+            is_main: true,
+        }
+    }
+    pub fn linked(id: String, path: PathBuf) -> Self {
+        Self {
+            id,
+            path,
+            is_main: false,
+        }
+    }
+    /// A short display label for the worktree. Returns "main" for the
+    /// main worktree and the linked worktree's id otherwise.
+    pub fn label(&self) -> &str {
+        if self.is_main {
+            "main"
+        } else {
+            self.id.as_str()
+        }
+    }
+}
+
+/// Resolve the shared ("common") git directory for `repo`.
+///
+/// For the main worktree this is simply `git_dir()` (e.g.
+/// `/foo/.git/`). For a linked worktree it is read from the
+/// `commondir` file inside the worktree's gitdir, which contains a
+/// relative path to the shared gitdir — this matches git's own
+/// behaviour and avoids depending on gix's `common_dir()` which
+/// doesn't resolve the commondir file.
+fn shared_git_dir(repo: &gix::Repository) -> PathBuf {
+    let git_dir = repo.git_dir().to_path_buf();
+    let commondir_file = git_dir.join("commondir");
+    if commondir_file.is_file() {
+        if let Ok(rel) = std::fs::read_to_string(&commondir_file) {
+            let joined = git_dir.join(rel.trim());
+            return std::fs::canonicalize(&joined).unwrap_or(joined);
+        }
+    }
+    git_dir
+}
+
+/// Is `repo` a linked (not main) worktree? Determined by the
+/// presence of a `commondir` file in its gitdir.
+fn is_linked_worktree(repo: &gix::Repository) -> bool {
+    repo.git_dir().join("commondir").is_file()
+}
+
+/// Return the path of the main worktree for a repository (the
+/// directory containing the canonical `.git` directory). Returns
+/// `None` for bare repositories.
+pub fn main_worktree_path(repo: &gix::Repository) -> Option<PathBuf> {
+    shared_git_dir(repo).parent().map(|p| p.to_path_buf())
+}
+
+/// Describe the worktree that `repo` was opened from.
+///
+/// A worktree is considered "linked" iff its gitdir contains a
+/// `commondir` file.
+pub fn current_worktree(repo: &gix::Repository) -> Result<WorktreeInfo> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| anyhow::anyhow!("bare repository not supported"))?
+        .to_path_buf();
+
+    if is_linked_worktree(repo) {
+        let id = repo
+            .git_dir()
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("could not determine worktree id"))?;
+        Ok(WorktreeInfo::linked(id, workdir))
+    } else {
+        Ok(WorktreeInfo::main(workdir))
+    }
+}
+
+/// List all worktrees (main + linked) associated with the repository.
+///
+/// Enumerates linked worktrees by reading `<shared_git_dir>/worktrees/`
+/// and resolving each entry's `gitdir` file to the worktree root.
+pub fn list_worktrees(repo: &gix::Repository) -> Result<Vec<WorktreeInfo>> {
+    let mut out = Vec::new();
+
+    if let Some(main_path) = main_worktree_path(repo) {
+        if main_path.exists() {
+            out.push(WorktreeInfo::main(main_path));
+        }
+    }
+
+    let worktrees_dir = shared_git_dir(repo).join("worktrees");
+    if worktrees_dir.is_dir() {
+        let mut entries: Vec<_> = std::fs::read_dir(&worktrees_dir)
+            .with_context(|| format!("reading {}", worktrees_dir.display()))?
+            .filter_map(|e| e.ok())
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if !ft.is_dir() {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            let gitdir_file = entry.path().join("gitdir");
+            let content = match std::fs::read_to_string(&gitdir_file) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            // The `gitdir` file contains the path to the worktree's
+            // `.git` file. The worktree root is its parent directory.
+            let gitdir_path = PathBuf::from(content.trim());
+            if let Some(workdir) = gitdir_path.parent() {
+                out.push(WorktreeInfo::linked(id, workdir.to_path_buf()));
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 /// Get the HEAD commit hash as a hex string.
+
 pub fn head_commit_hex(repo: &gix::Repository) -> Result<String> {
-    let head = repo.head_commit()
+    let head = repo
+        .head_commit()
         .context("failed to resolve HEAD commit")?;
     Ok(head.id().to_hex().to_string())
 }
@@ -24,11 +172,13 @@ pub fn resolve_commit_hex(repo: &gix::Repository, spec: Option<&str>) -> Result<
     match spec {
         None | Some("HEAD") => head_commit_hex(repo),
         Some(spec) => {
-            let id = repo.rev_parse_single(spec)
+            let id = repo
+                .rev_parse_single(spec)
                 .with_context(|| format!("failed to resolve revision '{}'", spec))?;
             // Peel to a commit to ensure the spec actually points at
             // a commit (not a tree/blob).
-            let commit = id.object()
+            let commit = id
+                .object()
                 .with_context(|| format!("failed to find object for '{}'", spec))?
                 .try_into_commit()
                 .map_err(|_| anyhow::anyhow!("'{}' does not point to a commit", spec))?;
@@ -41,8 +191,7 @@ pub fn resolve_commit_hex(repo: &gix::Repository, spec: Option<&str>) -> Result<
 /// as `(index_position, path)` pairs. The paths are relative to the
 /// repository root.
 pub fn index_entries(repo: &gix::Repository) -> Result<Vec<(usize, String)>> {
-    let index = repo.index()
-        .context("failed to read git index")?;
+    let index = repo.index().context("failed to read git index")?;
     let entries: Vec<(usize, String)> = index
         .entries()
         .iter()
@@ -58,32 +207,29 @@ pub fn index_entries(repo: &gix::Repository) -> Result<Vec<(usize, String)>> {
 /// Read a blob from the repository's HEAD tree at the given path.
 /// Returns the raw blob content.
 pub fn read_blob_at_head(repo: &gix::Repository, path: &str) -> Result<Vec<u8>> {
-    let head = repo.head_commit()
+    let head = repo
+        .head_commit()
         .context("failed to resolve HEAD commit")?;
-    let tree = head.tree()
-        .context("failed to get HEAD tree")?;
-    let entry = tree.lookup_entry_by_path(path)
+    let tree = head.tree().context("failed to get HEAD tree")?;
+    let entry = tree
+        .lookup_entry_by_path(path)
         .context("failed to look up path in tree")?
         .ok_or_else(|| anyhow::anyhow!("path not found in tree: {}", path))?;
-    let object = entry.object()
-        .context("failed to read object")?;
+    let object = entry.object().context("failed to read object")?;
     Ok(object.data.to_vec())
 }
 
 /// Read a blob from a specific commit (given as hex hash) at the
 /// given path.
 pub fn read_blob(repo: &gix::Repository, commit_hex: &str, path: &str) -> Result<Vec<u8>> {
-    let oid = gix::ObjectId::from_hex(commit_hex.as_bytes())
-        .context("invalid commit hash hex")?;
-    let commit = repo.find_commit(oid)
-        .context("failed to find commit")?;
-    let tree = commit.tree()
-        .context("failed to get tree from commit")?;
-    let entry = tree.lookup_entry_by_path(path)
+    let oid = gix::ObjectId::from_hex(commit_hex.as_bytes()).context("invalid commit hash hex")?;
+    let commit = repo.find_commit(oid).context("failed to find commit")?;
+    let tree = commit.tree().context("failed to get tree from commit")?;
+    let entry = tree
+        .lookup_entry_by_path(path)
         .context("failed to look up path in tree")?
         .ok_or_else(|| anyhow::anyhow!("path not found in tree: {}", path))?;
-    let object = entry.object()
-        .context("failed to read object")?;
+    let object = entry.object().context("failed to read object")?;
     Ok(object.data.to_vec())
 }
 
@@ -105,16 +251,18 @@ pub fn changed_files_between(
 ) -> Result<TreeDiff> {
     use gix::object::tree::diff::Change;
 
-    let old_oid = gix::ObjectId::from_hex(old_commit_hex.as_bytes())
-        .context("invalid old commit hash")?;
-    let new_oid = gix::ObjectId::from_hex(new_commit_hex.as_bytes())
-        .context("invalid new commit hash")?;
+    let old_oid =
+        gix::ObjectId::from_hex(old_commit_hex.as_bytes()).context("invalid old commit hash")?;
+    let new_oid =
+        gix::ObjectId::from_hex(new_commit_hex.as_bytes()).context("invalid new commit hash")?;
 
-    let old_tree = repo.find_commit(old_oid)
+    let old_tree = repo
+        .find_commit(old_oid)
         .context("failed to find old commit")?
         .tree()
         .context("failed to get old tree")?;
-    let new_tree = repo.find_commit(new_oid)
+    let new_tree = repo
+        .find_commit(new_oid)
         .context("failed to find new commit")?
         .tree()
         .context("failed to get new tree")?;
@@ -124,7 +272,9 @@ pub fn changed_files_between(
     old_tree
         .changes()
         .context("failed to create tree diff platform")?
-        .options(|opts| { opts.track_path(); })
+        .options(|opts| {
+            opts.track_path();
+        })
         .for_each_to_obtain_tree(&new_tree, |change| {
             let path = change.location().to_string();
             match change {
@@ -140,27 +290,17 @@ pub fn changed_files_between(
 /// Get file entries at a specific commit by traversing the commit's
 /// tree in-process via gitoxide. Returns `(position, path)` pairs
 /// sorted by path, matching the ordering used by `index_entries`.
-pub fn entries_at_commit(
-    repo: &gix::Repository,
-    commit_hex: &str,
-) -> Result<Vec<(usize, String)>> {
-    let oid = gix::ObjectId::from_hex(commit_hex.as_bytes())
-        .context("invalid commit hash")?;
-    let commit = repo.find_commit(oid)
-        .context("failed to find commit")?;
-    let tree = commit.tree()
-        .context("failed to get tree from commit")?;
+pub fn entries_at_commit(repo: &gix::Repository, commit_hex: &str) -> Result<Vec<(usize, String)>> {
+    let oid = gix::ObjectId::from_hex(commit_hex.as_bytes()).context("invalid commit hash")?;
+    let commit = repo.find_commit(oid).context("failed to find commit")?;
+    let tree = commit.tree().context("failed to get tree from commit")?;
 
     let mut paths = Vec::new();
     collect_tree_entries(repo, tree.id().into(), "", &mut paths)?;
     // Git index and ls-tree both sort entries by path.
     paths.sort();
 
-    Ok(paths
-        .into_iter()
-        .enumerate()
-        .map(|(i, p)| (i, p))
-        .collect())
+    Ok(paths.into_iter().enumerate().map(|(i, p)| (i, p)).collect())
 }
 
 /// Describes how a snippet relates to the current file on disk.
@@ -185,15 +325,15 @@ impl SnippetStaleness {
     pub fn note(&self) -> Option<&'static str> {
         match self {
             SnippetStaleness::Current => None,
-            SnippetStaleness::Moved => {
-                Some("(note: this snippet may have moved — the file on disk differs at this offset)")
-            }
-            SnippetStaleness::Modified => {
-                Some("(note: this snippet may have changed — the file on disk differs from the indexed version)")
-            }
-            SnippetStaleness::Missing => {
-                Some("(note: this file was not found on disk — it may have been renamed or removed)")
-            }
+            SnippetStaleness::Moved => Some(
+                "(note: this snippet may have moved — the file on disk differs at this offset)",
+            ),
+            SnippetStaleness::Modified => Some(
+                "(note: this snippet may have changed — the file on disk differs from the indexed version)",
+            ),
+            SnippetStaleness::Missing => Some(
+                "(note: this file was not found on disk — it may have been renamed or removed)",
+            ),
         }
     }
 }
@@ -220,9 +360,7 @@ pub fn check_snippet_staleness(
 
     // Check whether the chunk matches at the original byte offset.
     let end = byte_offset + chunk_len;
-    if end <= disk_content.len()
-        && disk_content[byte_offset..end] == *chunk_text
-    {
+    if end <= disk_content.len() && disk_content[byte_offset..end] == *chunk_text {
         return SnippetStaleness::Current;
     }
 
@@ -254,7 +392,8 @@ fn collect_tree_entries(
     prefix: &str,
     paths: &mut Vec<String>,
 ) -> Result<()> {
-    let object = repo.find_object(tree_id)
+    let object = repo
+        .find_object(tree_id)
         .context("failed to find tree object")?;
     let tree = object
         .try_into_tree()
@@ -262,7 +401,9 @@ fn collect_tree_entries(
 
     for entry_ref in tree.iter() {
         let entry = entry_ref.context("failed to decode tree entry")?;
-        let name = entry.filename().to_str()
+        let name = entry
+            .filename()
+            .to_str()
             .map_err(|_| anyhow::anyhow!("non-UTF-8 filename"))?;
         let full_path = if prefix.is_empty() {
             name.to_string()
@@ -328,13 +469,7 @@ mod tests {
         let file = dir.path().join("hello.txt");
         std::fs::write(&file, b"completely different content").unwrap();
 
-        let result = check_snippet_staleness(
-            dir.path(),
-            "hello.txt",
-            0,
-            3,
-            b"bbb",
-        );
+        let result = check_snippet_staleness(dir.path(), "hello.txt", 0, 3, b"bbb");
         assert_eq!(result, SnippetStaleness::Modified);
         assert!(result.note().is_some());
         assert!(result.note().unwrap().contains("changed"));
@@ -344,13 +479,7 @@ mod tests {
     fn staleness_missing_when_file_gone() {
         let dir = tempfile::tempdir().unwrap();
 
-        let result = check_snippet_staleness(
-            dir.path(),
-            "nonexistent.txt",
-            0,
-            3,
-            b"abc",
-        );
+        let result = check_snippet_staleness(dir.path(), "nonexistent.txt", 0, 3, b"abc");
         assert_eq!(result, SnippetStaleness::Missing);
         assert!(result.note().is_some());
         assert!(result.note().unwrap().contains("not found"));
@@ -362,13 +491,7 @@ mod tests {
         let file = dir.path().join("f.txt");
         std::fs::write(&file, b"hello world").unwrap();
 
-        let result = check_snippet_staleness(
-            dir.path(),
-            "f.txt",
-            0,
-            5,
-            b"hello",
-        );
+        let result = check_snippet_staleness(dir.path(), "f.txt", 0, 5, b"hello");
         assert_eq!(result, SnippetStaleness::Current);
     }
 
@@ -379,14 +502,125 @@ mod tests {
         // Chunk was at offset 10 len 5, but file is now only 8 bytes.
         std::fs::write(&file, b"short").unwrap();
 
-        let result = check_snippet_staleness(
-            dir.path(),
-            "f.txt",
-            10,
-            5,
-            b"xxxxx",
-        );
+        let result = check_snippet_staleness(dir.path(), "f.txt", 10, 5, b"xxxxx");
         assert_eq!(result, SnippetStaleness::Modified);
+    }
+
+    // ── Worktree integration tests ───────────────────────────
+
+    /// Create a git repository with an initial commit and one linked
+    /// worktree. Returns (tempdir, main_path, linked_path).
+    fn make_repo_with_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+
+        let run = |cwd: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .expect("git");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        run(&main, &["init", "-q", "-b", "main"]);
+        std::fs::write(main.join("hello.txt"), b"hello\n").unwrap();
+        run(&main, &["add", "hello.txt"]);
+        run(&main, &["commit", "-q", "-m", "initial"]);
+
+        let linked = tmp.path().join("wt2");
+        run(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "branch2",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        (tmp, main, linked)
+    }
+
+    #[test]
+    fn current_worktree_on_main() {
+        let (_tmp, main, _linked) = make_repo_with_worktree();
+        let repo = open_repo(&main).unwrap();
+        let wt = current_worktree(&repo).unwrap();
+        assert!(wt.is_main);
+        assert_eq!(wt.id, "");
+        assert_eq!(wt.label(), "main");
+        assert_eq!(
+            std::fs::canonicalize(&wt.path).unwrap(),
+            std::fs::canonicalize(&main).unwrap()
+        );
+    }
+
+    #[test]
+    fn current_worktree_on_linked() {
+        let (_tmp, _main, linked) = make_repo_with_worktree();
+        let repo = open_repo(&linked).unwrap();
+        let wt = current_worktree(&repo).unwrap();
+        assert!(!wt.is_main);
+        assert_eq!(wt.id, "wt2");
+        assert_eq!(wt.label(), "wt2");
+        assert_eq!(
+            std::fs::canonicalize(&wt.path).unwrap(),
+            std::fs::canonicalize(&linked).unwrap()
+        );
+    }
+
+    #[test]
+    fn main_worktree_path_from_linked() {
+        let (_tmp, main, linked) = make_repo_with_worktree();
+        let repo = open_repo(&linked).unwrap();
+        let mp = main_worktree_path(&repo).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&mp).unwrap(),
+            std::fs::canonicalize(&main).unwrap()
+        );
+    }
+
+    #[test]
+    fn list_worktrees_returns_main_and_linked() {
+        let (_tmp, main, linked) = make_repo_with_worktree();
+        for open_from in &[&main, &linked] {
+            let repo = open_repo(open_from).unwrap();
+            let listed = list_worktrees(&repo).unwrap();
+            assert_eq!(
+                listed.len(),
+                2,
+                "expected 2 worktrees when opened from {}",
+                open_from.display()
+            );
+
+            let main_entry = listed.iter().find(|w| w.is_main).expect("main entry");
+            let linked_entry = listed.iter().find(|w| !w.is_main).expect("linked entry");
+
+            assert_eq!(main_entry.id, "");
+            assert_eq!(linked_entry.id, "wt2");
+            assert_eq!(
+                std::fs::canonicalize(&main_entry.path).unwrap(),
+                std::fs::canonicalize(&main).unwrap()
+            );
+            assert_eq!(
+                std::fs::canonicalize(&linked_entry.path).unwrap(),
+                std::fs::canonicalize(&linked).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -396,13 +630,7 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("lib.rs"), b"fn main() {}").unwrap();
 
-        let result = check_snippet_staleness(
-            dir.path(),
-            "src/lib.rs",
-            0,
-            12,
-            b"fn main() {}",
-        );
+        let result = check_snippet_staleness(dir.path(), "src/lib.rs", 0, 12, b"fn main() {}");
         assert_eq!(result, SnippetStaleness::Current);
     }
 }

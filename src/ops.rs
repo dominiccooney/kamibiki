@@ -76,7 +76,10 @@ impl IndexProgress for StderrProgress {
     }
     fn on_chunk_done(&self) {}
     fn on_embed_start(&self, total: usize, already_done: usize) {
-        eprintln!("  Embedding {} chunks ({} already done)...", total, already_done);
+        eprintln!(
+            "  Embedding {} chunks ({} already done)...",
+            total, already_done
+        );
     }
     fn on_embed_progress(&self, _completed: usize) {
         // no-op for simple stderr
@@ -104,17 +107,45 @@ pub struct IndexResult {
 /// Index a single repository. This is the core indexing pipeline,
 /// shared between the CLI and MCP server.
 ///
+/// `worktree_path` is the path of the working tree from which to
+/// open the git repository (for HEAD resolution and revision
+/// parsing). When using a registered repository by name, this is
+/// simply `repo_cfg.path`. When resolving `.` from inside a linked
+/// worktree, this is that linked worktree's path — so `HEAD` etc.
+/// refer to the worktree the user is operating in.
+///
+/// The `.kb/` directory is always located at `repo_cfg.path`; since
+/// index files are keyed by commit hash and git objects are shared
+/// across worktrees, a single `.kb/` serves all worktrees of a
+/// repository.
+///
 /// `commit` is an optional git revision spec (commit hash, branch
-/// name, tag, HEAD~1, etc.). When `None`, indexes at HEAD.
+/// name, tag, HEAD~1, etc.). When `None`, indexes at HEAD of the
+/// given worktree.
+///
+/// When `compact` is `true`, produces a self-contained root index
+/// (parent hash all zeroes) at the target commit. The existing
+/// `.kbi` (if any) and the most recent other index are both used
+/// as sources of reusable embeddings — identical chunks by path
+/// and content are copied over instead of re-embedded through the
+/// API. The new index is written to a side file
+/// `<commit>.kbi.compact` and, once complete, atomically renamed
+/// over the existing file so the old delta remains usable until
+/// replacement. If interrupted, re-running resumes the partial
+/// compact build. Walks of the index chain sink (terminate) at a
+/// compact index.
+
 pub async fn index_repo(
     repo_cfg: &RepoConfig,
+    worktree_path: &Path,
     api_key: &str,
     progress: &dyn IndexProgress,
     commit: Option<&str>,
+    compact: bool,
 ) -> Result<IndexResult> {
     progress.on_start(&repo_cfg.name);
 
-    let repo = git::open_repo(&repo_cfg.path)?;
+    let repo = git::open_repo(worktree_path)?;
     let commit_hex = git::resolve_commit_hex(&repo, commit)?;
     let ref_label = commit.unwrap_or("HEAD");
     progress.on_message(&format!(
@@ -128,17 +159,67 @@ pub async fn index_repo(
 
     let kb_dir = repo_cfg.path.join(".kb");
     std::fs::create_dir_all(&kb_dir)?;
-    let index_path = kb_dir.join(format!(
-        "{}.kbi",
+
+    let index_path = kb_dir.join(format!("{}.kbi", &commit_hex[..commit_hex.len().min(16)]));
+
+    // ── Determine work path ──────────────────────────────────
+    //
+    // For non-compact indexing we read, resume, and write directly
+    // to the final `index_path`. For compact indexing, if the
+    // existing `.kbi` at that commit is already a self-contained
+    // root (parent_hash = 0), we operate on it in place. Otherwise,
+    // we write the new compact index to a side file
+    // (`<commit>.kbi.compact`) so the existing file remains
+    // available as a source of reusable embeddings; once the new
+    // index is fully populated it is atomically renamed over the
+    // old file. If a prior compact build was interrupted, its
+    // side file is picked up and the work continues from there.
+
+    let compact_work_path = kb_dir.join(format!(
+        "{}.kbi.compact",
         &commit_hex[..commit_hex.len().min(16)]
     ));
+
+    let existing_is_compact = index_path.exists()
+        && index::MmapIndexReader::open(&index_path)
+            .map(|r| r.parent_hash().iter().all(|&b| b == 0))
+            .unwrap_or(false);
+
+    let work_path: PathBuf = if compact {
+        if compact_work_path.exists() {
+            // Resuming an interrupted compact build.
+            compact_work_path.clone()
+        } else if existing_is_compact {
+            // Nothing to preserve — the existing file is already
+            // compact, so write in place without a rename dance.
+            index_path.clone()
+        } else {
+            compact_work_path.clone()
+        }
+    } else {
+        index_path.clone()
+    };
+
+    // Pre-compute the list of index files that can supply reusable
+    // embeddings to the build happening at `work_path`. Order
+    // matters only for progress reporting; each source is scanned
+    // independently and fills in matching chunks by path + text.
+    let mut prefill_sources: Vec<(PathBuf, String)> = Vec::new();
+    if compact && index_path.exists() && index_path != work_path {
+        if let Ok(reader) = index::MmapIndexReader::open(&index_path) {
+            let hex = commit_hash_to_hex(&reader.header().commit_hash);
+            if !hex.is_empty() {
+                prefill_sources.push((index_path.clone(), hex));
+            }
+        }
+    }
 
     // ── Determine file layout ────────────────────────────────
 
     let mut is_delta = false;
 
-    let file_infos: Vec<FileChunkInfo> = if index_path.exists() {
-        let data = std::fs::read(&index_path)?;
+    let file_infos: Vec<FileChunkInfo> = if work_path.exists() {
+        let data = std::fs::read(&work_path)?;
         let infos = index::read_file_infos(&data, &entries)?;
         let total = infos.iter().map(|f| f.chunk_count()).sum::<usize>();
         progress.on_message(&format!(
@@ -146,12 +227,45 @@ pub async fn index_repo(
             infos.len(),
             total,
         ));
+
+        // Determine whether this resumed index is a delta so we
+        // report it correctly to the caller.
+        if let Ok(reader) = index::MmapIndexReader::open(&work_path) {
+            if !reader.parent_hash().iter().all(|&b| b == 0) {
+                is_delta = true;
+            }
+        }
+
         infos
     } else {
         // Try delta mode: find an existing parent index to build on.
-        let parent_info = find_parent_index_info(&kb_dir, &index_path);
+        // Skipped entirely when the caller asked for a compact
+        // (self-contained) index — compact always chunks every
+        // tracked file at the target commit and writes a full
+        // layout with parent_hash = 0. Reusable embeddings are
+        // still pulled from the existing file (if any) and from
+        // the newest other index, via `prefill_sources`.
+        let parent_info = if compact {
+            // For compact, we still want the most recent *other*
+            // index (not the file we're about to replace) as an
+            // embedding source — delta-style matching by path and
+            // chunk text. Don't record it as the header parent.
+            find_parent_index_info(&kb_dir, &[&index_path, &compact_work_path, &work_path])
+        } else {
+            find_parent_index_info(&kb_dir, &[&index_path])
+        };
 
-        let (infos, parent_hash) = if let Some((_, ref parent_commit_hex)) = parent_info {
+        let (infos, parent_hash) = if compact {
+            // Compact: chunk every tracked file at the target commit.
+            let infos = chunk_all_files(worktree_path, &entries, &commit_hex, progress)?;
+            if let Some((_, ref parent_commit_hex)) = parent_info {
+                progress.on_message(&format!(
+                    "Will reuse embeddings from {} (delta source)",
+                    &parent_commit_hex[..parent_commit_hex.len().min(12)],
+                ));
+            }
+            (infos, [0u8; MAX_HASH_LEN])
+        } else if let Some((_, ref parent_commit_hex)) = parent_info {
             is_delta = true;
             // Delta mode: only chunk files that changed since the parent.
             let diff = git::changed_files_between(&repo, parent_commit_hex, &commit_hex)?;
@@ -183,7 +297,8 @@ pub async fn index_repo(
                 .cloned()
                 .collect();
 
-            let mut infos = chunk_all_files(&repo_cfg.path, &changed_entries, &commit_hex, progress)?;
+            let mut infos =
+                chunk_all_files(worktree_path, &changed_entries, &commit_hex, progress)?;
 
             // Any changed file that didn't produce chunks (binary,
             // empty, unreadable) also needs a tombstone to suppress
@@ -221,7 +336,7 @@ pub async fn index_repo(
             (infos, ph)
         } else {
             // Full mode: no parent index exists.
-            let infos = chunk_all_files(&repo_cfg.path, &entries, &commit_hex, progress)?;
+            let infos = chunk_all_files(worktree_path, &entries, &commit_hex, progress)?;
             (infos, [0u8; MAX_HASH_LEN])
         };
 
@@ -236,25 +351,46 @@ pub async fn index_repo(
             parent_hash,
         };
 
-        index::write_skeleton(&index_path, &header, &infos)?;
+        index::write_skeleton(&work_path, &header, &infos)?;
 
-        // Pre-fill reusable embeddings from the parent index.
-        if let Some((ref parent_path, ref parent_commit_hex)) = parent_info {
-            let reused = prefill_reusable_embeddings(
-                &repo,
-                &index_path,
-                &infos,
-                &commit_hex,
-                parent_path,
-                parent_commit_hex,
-                progress,
-            )?;
-            if reused > 0 {
-                progress.on_message(&format!("Reused {} embeddings from parent index", reused));
+        // Any parent found via `find_parent_index_info` is also
+        // eligible as a pre-fill source. In compact mode this is
+        // the "delta ancestor"; in normal delta mode this is the
+        // header parent, as before.
+        if let Some(pi) = parent_info {
+            if !prefill_sources.iter().any(|(p, _)| p == &pi.0) {
+                prefill_sources.push(pi);
             }
         }
 
-        progress.on_message(&format!("Pre-allocated index: {}", index_path.display()));
+        let mut total_reused = 0usize;
+        for (src_path, src_hex) in &prefill_sources {
+            let reused = prefill_reusable_embeddings(
+                &repo,
+                &work_path,
+                &infos,
+                &commit_hex,
+                src_path,
+                src_hex,
+                progress,
+            )?;
+            total_reused += reused;
+            if reused > 0 {
+                progress.on_message(&format!(
+                    "Reused {} embeddings from {}",
+                    reused,
+                    src_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                ));
+            }
+        }
+        if total_reused == 0 && !prefill_sources.is_empty() {
+            progress.on_message("No embeddings reusable from existing indexes.");
+        }
+
+        progress.on_message(&format!("Pre-allocated index: {}", work_path.display()));
         infos
     };
 
@@ -284,8 +420,9 @@ pub async fn index_repo(
 
     // ── Detect incomplete files ──────────────────────────────
 
-    let data = std::fs::read(&index_path)?;
+    let data = std::fs::read(&work_path)?;
     let layout = Arc::new(index::index_layout(&data)?);
+
     let needs_work = index::detect_incomplete(&data, &layout);
 
     let skip_chunks: HashSet<(usize, usize)> = {
@@ -330,13 +467,17 @@ pub async fn index_repo(
 
     // ── Pipeline: produce cross-file batches, embed concurrently ──
 
-    let (tx, mut rx) =
-        tokio::sync::mpsc::channel::<EmbedBatch>(CONCURRENT_EMBED_REQUESTS * 2);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<EmbedBatch>(CONCURRENT_EMBED_REQUESTS * 2);
 
     let file_infos = Arc::new(file_infos);
     let file_infos_for_producer = Arc::clone(&file_infos);
-    let repo_path = repo_cfg.path.to_path_buf();
+    // Producer thread reads blobs from the git object database. Any
+    // worktree of the repo can read any commit's objects, but we
+    // pass the current worktree_path to stay consistent with the
+    // HEAD we resolved above.
+    let repo_path = worktree_path.to_path_buf();
     let skip_chunks = Arc::new(skip_chunks);
+
     let skip_chunks_for_producer = Arc::clone(&skip_chunks);
     let producer_commit_hex = commit_hex.clone();
 
@@ -373,8 +514,7 @@ pub async fn index_repo(
                     continue;
                 }
 
-                let text =
-                    String::from_utf8_lossy(chunk.content(&content)).into_owned();
+                let text = String::from_utf8_lossy(chunk.content(&content)).into_owned();
                 let chunk_tokens = tc.count(text.as_bytes());
 
                 // Flush if adding this chunk would exceed API limits.
@@ -442,7 +582,7 @@ pub async fn index_repo(
                 match result {
                     Ok(Ok((locations, embeddings, count))) => {
                         index::write_embeddings_scattered(
-                            &index_path, &layout, &locations, &embeddings,
+                            &work_path, &layout, &locations, &embeddings,
                         )?;
                         completed_chunks += count;
                         progress.on_embed_progress(completed_chunks);
@@ -455,6 +595,7 @@ pub async fn index_repo(
                         had_error = true;
                         break;
                     }
+
                     Err(e) => {
                         progress.on_warning(&format!(
                             "task panicked: {}. Progress saved, re-run to resume.",
@@ -472,10 +613,9 @@ pub async fn index_repo(
     while let Some(result) = join_set.join_next().await {
         match result {
             Ok(Ok((locations, embeddings, count))) => {
-                index::write_embeddings_scattered(
-                    &index_path, &layout, &locations, &embeddings,
-                )?;
+                index::write_embeddings_scattered(&work_path, &layout, &locations, &embeddings)?;
                 completed_chunks += count;
+
                 progress.on_embed_progress(completed_chunks);
             }
             Ok(Err(e)) => {
@@ -510,6 +650,21 @@ pub async fn index_repo(
 
     let file_count = file_infos.len();
     if !had_error {
+        // Atomically publish the compact index over the existing
+        // one, if we were building in a side file. fs::rename on
+        // the same filesystem is atomic on Unix and best-effort on
+        // Windows; the old file is only removed once the new file
+        // is fully populated.
+        if work_path != index_path {
+            std::fs::rename(&work_path, &index_path).with_context(|| {
+                format!(
+                    "failed to rename {} → {}",
+                    work_path.display(),
+                    index_path.display()
+                )
+            })?;
+        }
+
         progress.on_message(&format!(
             "Wrote index: {} ({} files, {} embeddings)",
             index_path.display(),
@@ -573,8 +728,7 @@ pub fn chunk_all_files(
                 let content = THREAD_REPO.with(|cell| {
                     let mut opt = cell.borrow_mut();
                     let repo = opt.get_or_insert_with(|| {
-                        git::open_repo(&repo_path)
-                            .expect("failed to open repo in worker thread")
+                        git::open_repo(&repo_path).expect("failed to open repo in worker thread")
                     });
                     git::read_blob(repo, commit_hex, path).ok()
                 });
@@ -626,13 +780,14 @@ pub fn chunk_all_files(
 /// Find the most recent existing index file to use as a parent for
 /// delta indexing. Returns `(path, commit_hex)` of the parent index,
 /// or `None` if no suitable parent exists.
-fn find_parent_index_info(kb_dir: &Path, exclude_path: &Path) -> Option<(PathBuf, String)> {
+fn find_parent_index_info(kb_dir: &Path, exclude: &[&Path]) -> Option<(PathBuf, String)> {
     let mut kbi_files: Vec<_> = std::fs::read_dir(kb_dir)
         .ok()?
         .filter_map(|e| e.ok())
         .filter(|e| {
             let p = e.path();
-            p.extension().is_some_and(|ext| ext == "kbi") && p != exclude_path
+            p.extension().is_some_and(|ext| ext == "kbi")
+                && !exclude.iter().any(|x| *x == p.as_path())
         })
         .collect();
 
@@ -758,12 +913,7 @@ fn prefill_reusable_embeddings(
 
     let count = locations.len();
     if !locations.is_empty() {
-        index::write_embeddings_scattered(
-            new_index_path,
-            &new_layout,
-            &locations,
-            &embeddings,
-        )?;
+        index::write_embeddings_scattered(new_index_path, &new_layout, &locations, &embeddings)?;
     }
 
     Ok(count)

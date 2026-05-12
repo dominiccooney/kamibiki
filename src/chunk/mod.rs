@@ -44,9 +44,8 @@ impl TokenCounter {
     /// Load the tokenizer for the Voyage embedding model from
     /// HuggingFace Hub (cached locally after first download).
     pub fn for_voyage() -> Result<Self> {
-        let tokenizer =
-            tokenizers::Tokenizer::from_pretrained("voyageai/voyage-code-3", None)
-                .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {}", e))?;
+        let tokenizer = tokenizers::Tokenizer::from_pretrained("voyageai/voyage-code-3", None)
+            .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {}", e))?;
         Ok(TokenCounter {
             tokenizer: Arc::new(tokenizer),
         })

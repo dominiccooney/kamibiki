@@ -69,7 +69,31 @@ kb index myproject --commit HEAD~3
 
 When `--commit` is omitted, it indexes at HEAD.
 
+Pass `--compact` to force a self-contained index at the target
+commit. Kamibiki normally writes small delta files that point back
+to an older "parent" index via a commit hash — searches walk that
+chain to fill in unchanged chunks. A compact index is a single
+standalone file (its parent hash is zero), so chain walks
+terminate there. This is useful when you want to drop the tail of
+a long delta chain, or stop a search from consulting older
+history.
+
+Compact rebuilds are embedding-preserving: every chunk whose
+(path, text) matches a chunk in the existing `.kbi` or the next
+most recent index is copied over verbatim — no API call — so
+recompacting a repository you've already indexed typically only
+embeds the handful of chunks whose bytes actually differ. The new
+index is written to a side file, then atomically renamed over the
+previous one; if interrupted, a re-run resumes the in-progress
+compact build.
+
+
+```sh
+kb index myproject --compact
+```
+
 ### Search
+
 
 ```sh
 kb search <name> <query>
@@ -115,7 +139,26 @@ commit, and embedding count.
 | `kb search <name> <query> [-n top] [-c commit]` | Search a repository |
 | `kb alias <name> <repos...>` | Create a shorthand for a group of repositories |
 | `kb drop <name>` | Delete all index files for a repository |
+| `kb gc [name] [--dry-run]` | Delete index files for commits no longer known to git |
 | `kb start` | Launch the MCP server on stdio |
+
+### Garbage collection
+
+`kb gc` walks each repository's `.kb` directory and deletes any
+`.kbi` file whose indexed commit no longer resolves in git. This
+cleans up after branches that have been rewritten or rebased and
+whose tip commits have been reaped by git's own garbage collector.
+
+A dying commit's parent is often still live (you'd typically reindex
+the tip of a rewritten branch, not its ancestors), so `kb gc` never
+cascades deletions up or down the chain — it deletes only the files
+whose own commit is gone. As a consistency check it warns if a
+surviving index's `parent_hash` points at one of the files being
+removed, which shouldn't normally happen.
+
+Use `--dry-run` to preview what would be deleted without touching
+the filesystem. Omit `name` to gc every registered repository.
+
 
 ## MCP Server
 
@@ -139,6 +182,14 @@ Parameters:
 - `names` (optional): array of repository names; omit to index all
 - `commit` (optional): git revision to index at (commit hash, branch
   name, tag, `HEAD~1`, etc.). Defaults to HEAD.
+- `compact` (optional): when true, write a self-contained root index
+  (parent hash zero) at the target commit. Embeddings from the
+  existing `.kbi` and the next most recent index are reused
+  verbatim; only chunks whose text has no match get re-embedded.
+  The new file is atomically renamed over the old one. Defaults to
+  false.
+
+
 
 ### Connecting a coding agent
 

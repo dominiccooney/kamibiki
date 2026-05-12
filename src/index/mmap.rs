@@ -1,11 +1,11 @@
 use std::path::Path;
 
-use anyhow::{Result, ensure, Context};
+use anyhow::{Context, Result, ensure};
 use memmap2::Mmap;
 
-use crate::core::types::*;
 use super::IndexReader;
 use super::format::{HEADER_SIZE, decode_offset_table};
+use crate::core::types::*;
 
 /// An index reader backed by a memory-mapped file. Provides
 /// zero-copy access to embeddings and efficient chunk reference
@@ -91,8 +91,7 @@ impl MmapIndexReader {
         pos += total_chunks * 2;
 
         // --- Embedding alignment ---
-        let embeddings_offset =
-            (pos + EMBEDDING_ALIGNMENT - 1) & !(EMBEDDING_ALIGNMENT - 1);
+        let embeddings_offset = (pos + EMBEDDING_ALIGNMENT - 1) & !(EMBEDDING_ALIGNMENT - 1);
         ensure!(
             embeddings_offset + total_chunks * EMBEDDING_BYTES <= mmap.len(),
             "index truncated at embedding data"
@@ -207,7 +206,7 @@ impl IndexReader for MmapIndexReader {
 mod tests {
     use super::*;
     use crate::index::format::write_index;
-    use crate::index::{FileEntry, ChunkEntry};
+    use crate::index::{ChunkEntry, FileEntry};
     use std::io::Write;
 
     fn make_embedding(val: u8) -> BinaryEmbedding {
@@ -227,10 +226,7 @@ mod tests {
     }
 
     /// Write an index to a temp file and read it back.
-    fn write_and_read(
-        header: &IndexHeader,
-        entries: &[FileEntry],
-    ) -> MmapIndexReader {
+    fn write_and_read(header: &IndexHeader, entries: &[FileEntry]) -> MmapIndexReader {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.kbi");
         write_index(&path, header, entries).unwrap();
@@ -435,15 +431,25 @@ mod tests {
             FileEntry {
                 git_index_position: 0,
                 chunks: vec![
-                    ChunkEntry { byte_offset: 0, chunk_len: 100, embedding: make_embedding(0xA0) },
-                    ChunkEntry { byte_offset: 100, chunk_len: 200, embedding: make_embedding(0xA1) },
+                    ChunkEntry {
+                        byte_offset: 0,
+                        chunk_len: 100,
+                        embedding: make_embedding(0xA0),
+                    },
+                    ChunkEntry {
+                        byte_offset: 100,
+                        chunk_len: 200,
+                        embedding: make_embedding(0xA1),
+                    },
                 ],
             },
             FileEntry {
                 git_index_position: 3,
-                chunks: vec![
-                    ChunkEntry { byte_offset: 0, chunk_len: 50, embedding: make_embedding(0xB0) },
-                ],
+                chunks: vec![ChunkEntry {
+                    byte_offset: 0,
+                    chunk_len: 50,
+                    embedding: make_embedding(0xB0),
+                }],
             },
         ];
         let reader = write_and_read(&header, &entries);

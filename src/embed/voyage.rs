@@ -5,9 +5,9 @@ use anyhow::{Result, ensure};
 use reqwest::Client;
 use tokio::time::{Duration, Instant};
 
+use super::Embedder;
 use crate::chunk::TokenCounter;
 use crate::core::types::{BinaryEmbedding, EMBEDDING_BYTES};
-use super::Embedder;
 
 // ── Token rate limiter ───────────────────────────────────────────
 
@@ -60,8 +60,7 @@ impl TokenRateLimiter {
                 let mut inner = self.inner.lock().unwrap();
                 let now = Instant::now();
                 inner.prune(now);
-                let current: usize =
-                    inner.window.iter().map(|(_, t)| *t).sum();
+                let current: usize = inner.window.iter().map(|(_, t)| *t).sum();
 
                 if current + tokens <= inner.limit {
                     inner.window.push_back((now, tokens));
@@ -177,11 +176,7 @@ impl VoyageEmbedder {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Voyage text embedding failed: HTTP {}\n{}",
-                status,
-                text
-            );
+            anyhow::bail!("Voyage text embedding failed: HTTP {}\n{}", status, text);
         }
 
         let resp: TextEmbeddingResponse = response.json().await?;
@@ -256,28 +251,23 @@ impl Embedder for VoyageEmbedder {
         }
 
         // Allocate result storage.
-        let mut all_embeddings: Vec<BinaryEmbedding> = vec![[0u8; EMBEDDING_BYTES]; all_chunks.len()];
+        let mut all_embeddings: Vec<BinaryEmbedding> =
+            vec![[0u8; EMBEDDING_BYTES]; all_chunks.len()];
 
         // Batch chunks respecting API limits (max inputs per request
         // and actual token budget via the model's tokenizer).
         let tc = TokenCounter::for_voyage()?;
-        let chunk_token_counts: Vec<usize> = all_chunks
-            .iter()
-            .map(|c| tc.count(c.as_bytes()))
-            .collect();
+        let chunk_token_counts: Vec<usize> =
+            all_chunks.iter().map(|c| tc.count(c.as_bytes())).collect();
 
         let mut batch_start = 0;
         while batch_start < all_chunks.len() {
             let mut batch_end = batch_start;
             let mut batch_tokens = 0usize;
 
-            while batch_end < all_chunks.len()
-                && batch_end - batch_start < MAX_INPUTS_PER_REQUEST
-            {
+            while batch_end < all_chunks.len() && batch_end - batch_start < MAX_INPUTS_PER_REQUEST {
                 let chunk_tokens = chunk_token_counts[batch_end];
-                if batch_tokens + chunk_tokens > MAX_REQUEST_TOKENS
-                    && batch_end > batch_start
-                {
+                if batch_tokens + chunk_tokens > MAX_REQUEST_TOKENS && batch_end > batch_start {
                     break;
                 }
                 batch_tokens += chunk_tokens;

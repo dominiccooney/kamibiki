@@ -199,9 +199,8 @@ mod tests {
     use super::*;
     use std::sync::LazyLock;
 
-    static TEST_TC: LazyLock<TokenCounter> = LazyLock::new(|| {
-        TokenCounter::for_voyage().expect("failed to load tokenizer for tests")
-    });
+    static TEST_TC: LazyLock<TokenCounter> =
+        LazyLock::new(|| TokenCounter::for_voyage().expect("failed to load tokenizer for tests"));
 
     /// Verify chunks are contiguous and cover the entire input.
     fn assert_contiguous(chunks: &[Chunk], content: &[u8]) {
@@ -247,7 +246,11 @@ mod tests {
         let content = b"123456789\n123456789\n123456789\n123456789\n123456789\n";
         let chunks = chunk_by_lines(content, 5, &TEST_TC);
         assert_contiguous(&chunks, content);
-        assert!(chunks.len() >= 2, "expected multiple chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "expected multiple chunks, got {}",
+            chunks.len()
+        );
     }
 
     #[test]
@@ -272,7 +275,11 @@ mod tests {
         let content: Vec<u8> = "x\n".repeat(100).into_bytes();
         let chunks = chunk_by_lines(&content, 5, &TEST_TC);
         assert_contiguous(&chunks, &content);
-        assert!(chunks.len() >= 5, "expected many chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 5,
+            "expected many chunks, got {}",
+            chunks.len()
+        );
     }
 
     #[test]
@@ -296,7 +303,8 @@ mod tests {
 
     #[test]
     fn prefers_low_indent_breaks() {
-        let content = b"def foo():\n    line1\n    line2\n    line3\ndef bar():\n    line4\n    line5\n";
+        let content =
+            b"def foo():\n    line1\n    line2\n    line3\ndef bar():\n    line4\n    line5\n";
         let total_tokens = TEST_TC.count(content);
         let budget = total_tokens / 2 + 1;
         let chunks = chunk_by_lines(content, budget, &TEST_TC);
@@ -319,7 +327,10 @@ mod tests {
         let content = b"123456789\n123456789\n123456789\n123456789\n123456789\n123456789\n";
         let chunks = chunker.chunk("test.txt", content, 5).unwrap();
         assert_contiguous(&chunks, content);
-        assert!(chunks.len() >= 2, "expected multiple chunks with small token budget");
+        assert!(
+            chunks.len() >= 2,
+            "expected multiple chunks with small token budget"
+        );
     }
 
     #[test]
@@ -337,9 +348,24 @@ mod tests {
 
     #[test]
     fn break_score_blank_line_higher() {
-        let blank = LineInfo { start: 0, end: 1, indent: 0, is_blank: true };
-        let normal = LineInfo { start: 1, end: 10, indent: 0, is_blank: false };
-        let deep = LineInfo { start: 10, end: 20, indent: 8, is_blank: false };
+        let blank = LineInfo {
+            start: 0,
+            end: 1,
+            indent: 0,
+            is_blank: true,
+        };
+        let normal = LineInfo {
+            start: 1,
+            end: 10,
+            indent: 0,
+            is_blank: false,
+        };
+        let deep = LineInfo {
+            start: 10,
+            end: 20,
+            indent: 8,
+            is_blank: false,
+        };
 
         let score_at_blank = break_score(&blank, &normal);
         let score_at_deep = break_score(&normal, &deep);

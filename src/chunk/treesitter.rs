@@ -29,9 +29,7 @@ impl Chunker for TreeSitterChunker {
 
         let language = language_for_path(path);
         match language {
-            Some(lang) => {
-                chunk_with_tree_sitter(lang, content, max_tokens, &self.token_counter)
-            }
+            Some(lang) => chunk_with_tree_sitter(lang, content, max_tokens, &self.token_counter),
             None => Ok(chunk_by_lines(content, max_tokens, &self.token_counter)),
         }
     }
@@ -44,18 +42,12 @@ pub fn language_for_path(path: &str) -> Option<Language> {
     match ext {
         "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
         "py" | "pyi" => Some(tree_sitter_python::LANGUAGE.into()),
-        "js" | "mjs" | "cjs" | "jsx" => {
-            Some(tree_sitter_javascript::LANGUAGE.into())
-        }
-        "ts" | "mts" | "cts" => {
-            Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
-        }
+        "js" | "mjs" | "cjs" | "jsx" => Some(tree_sitter_javascript::LANGUAGE.into()),
+        "ts" | "mts" | "cts" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
         "go" => Some(tree_sitter_go::LANGUAGE.into()),
         "c" | "h" => Some(tree_sitter_c::LANGUAGE.into()),
-        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => {
-            Some(tree_sitter_cpp::LANGUAGE.into())
-        }
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Some(tree_sitter_cpp::LANGUAGE.into()),
         "java" => Some(tree_sitter_java::LANGUAGE.into()),
         "rb" => Some(tree_sitter_ruby::LANGUAGE.into()),
         _ => None,
@@ -148,12 +140,7 @@ fn boundary_score(content: &[u8], prev_end: usize, next_start: usize) -> u32 {
 /// Uses prefix sums over per-child token counts for O(1) group size
 /// estimates, avoiding the O(N²) cost of re-tokenizing growing
 /// groups on every iteration.
-fn chunk_node(
-    node: Node,
-    content: &[u8],
-    max_tokens: usize,
-    tc: &TokenCounter,
-) -> Vec<Range> {
+fn chunk_node(node: Node, content: &[u8], max_tokens: usize, tc: &TokenCounter) -> Vec<Range> {
     let node_tokens = tc.count(&content[node.start_byte()..node.end_byte()]);
 
     // Base case: the node fits in one chunk.
@@ -172,11 +159,7 @@ fn chunk_node(
 
     // If no children (oversized leaf), fall back to line splitting.
     if children.is_empty() {
-        let sub = chunk_by_lines(
-            &content[node.start_byte()..node.end_byte()],
-            max_tokens,
-            tc,
-        );
+        let sub = chunk_by_lines(&content[node.start_byte()..node.end_byte()], max_tokens, tc);
         return sub
             .into_iter()
             .map(|c| Range {
@@ -227,11 +210,7 @@ fn chunk_node(
         let score = boundary_scores[i];
 
         if prospective_tokens > max_tokens && i > group_start_idx {
-            let break_idx = if let Some(bi) = best_break_idx {
-                bi
-            } else {
-                i
-            };
+            let break_idx = if let Some(bi) = best_break_idx { bi } else { i };
 
             emit_group(
                 &children,
@@ -322,9 +301,7 @@ fn emit_group(
             let ct = child_tokens[idx];
             if ct <= max_tokens {
                 // Try to merge with the previous range from this group.
-                if result.len() > group_result_start
-                    && running_tokens + ct <= max_tokens
-                {
+                if result.len() > group_result_start && running_tokens + ct <= max_tokens {
                     result.last_mut().unwrap().end = children[idx].end_byte();
                     running_tokens += ct;
                     continue;
@@ -355,7 +332,10 @@ fn ranges_to_chunks(ranges: &[Range], content_len: usize) -> Vec<Chunk> {
         if content_len == 0 {
             return Vec::new();
         }
-        return vec![Chunk { byte_offset: 0, len: content_len }];
+        return vec![Chunk {
+            byte_offset: 0,
+            len: content_len,
+        }];
     }
 
     // Deduplicate/skip fully-overlapped ranges and collect valid ones.
@@ -376,7 +356,10 @@ fn ranges_to_chunks(ranges: &[Range], content_len: usize) -> Vec<Chunk> {
         if content_len == 0 {
             return Vec::new();
         }
-        return vec![Chunk { byte_offset: 0, len: content_len }];
+        return vec![Chunk {
+            byte_offset: 0,
+            len: content_len,
+        }];
     }
 
     // Create chunks: one per merged range. The first chunk starts at
@@ -403,7 +386,10 @@ fn ranges_to_chunks(ranges: &[Range], content_len: usize) -> Vec<Chunk> {
 
     // Edge case: ensure we cover from 0.
     if chunks.is_empty() && content_len > 0 {
-        chunks.push(Chunk { byte_offset: 0, len: content_len });
+        chunks.push(Chunk {
+            byte_offset: 0,
+            len: content_len,
+        });
     }
 
     chunks
@@ -416,9 +402,8 @@ mod tests {
 
     const TEST_MAX_TOKENS: usize = 430;
 
-    static TEST_TC: LazyLock<TokenCounter> = LazyLock::new(|| {
-        TokenCounter::for_voyage().expect("failed to load tokenizer for tests")
-    });
+    static TEST_TC: LazyLock<TokenCounter> =
+        LazyLock::new(|| TokenCounter::for_voyage().expect("failed to load tokenizer for tests"));
 
     fn test_chunker() -> TreeSitterChunker {
         TreeSitterChunker::new(TEST_TC.clone())
@@ -449,8 +434,7 @@ mod tests {
     fn assert_content_matches(chunks: &[Chunk], content: &[u8]) {
         for chunk in chunks {
             let slice = chunk.content(content);
-            let expected =
-                &content[chunk.byte_offset..chunk.byte_offset + chunk.len];
+            let expected = &content[chunk.byte_offset..chunk.byte_offset + chunk.len];
             assert_eq!(slice, expected);
         }
     }
@@ -469,9 +453,7 @@ mod tests {
 }
 "#;
         let chunker = test_chunker();
-        let chunks = chunker
-            .chunk("test.rs", content, TEST_MAX_TOKENS)
-            .unwrap();
+        let chunks = chunker.chunk("test.rs", content, TEST_MAX_TOKENS).unwrap();
         assert_contiguous(&chunks, content);
         assert_content_matches(&chunks, content);
         assert_eq!(chunks.len(), 1);
@@ -493,9 +475,7 @@ mod tests {
         let tc = &*TEST_TC;
 
         let chunker = test_chunker();
-        let chunks = chunker
-            .chunk("test.rs", bytes, TEST_MAX_TOKENS)
-            .unwrap();
+        let chunks = chunker.chunk("test.rs", bytes, TEST_MAX_TOKENS).unwrap();
         assert_contiguous(&chunks, bytes);
         assert_content_matches(&chunks, bytes);
 
@@ -532,9 +512,7 @@ class Greeter:
         print(f"Hello, {self.name}!")
 "#;
         let chunker = test_chunker();
-        let chunks = chunker
-            .chunk("test.py", content, TEST_MAX_TOKENS)
-            .unwrap();
+        let chunks = chunker.chunk("test.py", content, TEST_MAX_TOKENS).unwrap();
         assert_contiguous(&chunks, content);
         assert_content_matches(&chunks, content);
     }
@@ -554,9 +532,7 @@ class Foo {
 }
 "#;
         let chunker = test_chunker();
-        let chunks = chunker
-            .chunk("test.js", content, TEST_MAX_TOKENS)
-            .unwrap();
+        let chunks = chunker.chunk("test.js", content, TEST_MAX_TOKENS).unwrap();
         assert_contiguous(&chunks, content);
         assert_content_matches(&chunks, content);
     }
@@ -572,9 +548,7 @@ function greet(name: string): void {
 }
 "#;
         let chunker = test_chunker();
-        let chunks = chunker
-            .chunk("test.ts", content, TEST_MAX_TOKENS)
-            .unwrap();
+        let chunks = chunker.chunk("test.ts", content, TEST_MAX_TOKENS).unwrap();
         assert_contiguous(&chunks, content);
         assert_content_matches(&chunks, content);
     }
@@ -594,9 +568,7 @@ func add(a, b int) int {
 }
 "#;
         let chunker = test_chunker();
-        let chunks = chunker
-            .chunk("test.go", content, TEST_MAX_TOKENS)
-            .unwrap();
+        let chunks = chunker.chunk("test.go", content, TEST_MAX_TOKENS).unwrap();
         assert_contiguous(&chunks, content);
         assert_content_matches(&chunks, content);
     }
@@ -605,9 +577,7 @@ func add(a, b int) int {
     fn unsupported_language_falls_back() {
         let content = b"some random content\nwith multiple lines\n";
         let chunker = test_chunker();
-        let chunks = chunker
-            .chunk("test.txt", content, TEST_MAX_TOKENS)
-            .unwrap();
+        let chunks = chunker.chunk("test.txt", content, TEST_MAX_TOKENS).unwrap();
         assert_contiguous(&chunks, content);
         assert_content_matches(&chunks, content);
     }
@@ -655,9 +625,7 @@ func add(a, b int) int {
         let bytes = content.as_bytes();
 
         let chunker = test_chunker();
-        let chunks = chunker
-            .chunk("big.rs", bytes, TEST_MAX_TOKENS)
-            .unwrap();
+        let chunks = chunker.chunk("big.rs", bytes, TEST_MAX_TOKENS).unwrap();
         assert_contiguous(&chunks, bytes);
         assert_content_matches(&chunks, bytes);
         assert!(chunks.len() > 5, "expected many chunks for large file");
@@ -700,9 +668,7 @@ func add(a, b int) int {
         }
         let bytes = content.as_bytes();
         let chunker = test_chunker();
-        let chunks = chunker
-            .chunk("test.rs", bytes, TEST_MAX_TOKENS)
-            .unwrap();
+        let chunks = chunker.chunk("test.rs", bytes, TEST_MAX_TOKENS).unwrap();
         assert_contiguous(&chunks, bytes);
         assert_content_matches(&chunks, bytes);
 
@@ -711,9 +677,8 @@ func add(a, b int) int {
                 continue;
             }
             let content_slice = chunk.content(bytes);
-            let start_text = std::str::from_utf8(
-                &content_slice[..content_slice.len().min(50)]
-            ).unwrap_or("");
+            let start_text =
+                std::str::from_utf8(&content_slice[..content_slice.len().min(50)]).unwrap_or("");
             assert!(
                 start_text.starts_with("///") || start_text.starts_with("fn "),
                 "chunk at offset {} starts with unexpected content: {:?}",
@@ -806,10 +771,7 @@ func Mul(a, b int) int {
     fn ranges_to_chunks_with_gaps() {
         // Ranges [10..20, 30..40] in a 50-byte file.
         // Should produce 2 chunks: [0..30) and [30..50).
-        let ranges = vec![
-            Range { start: 10, end: 20 },
-            Range { start: 30, end: 40 },
-        ];
+        let ranges = vec![Range { start: 10, end: 20 }, Range { start: 30, end: 40 }];
         let chunks = ranges_to_chunks(&ranges, 50);
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].byte_offset, 0);

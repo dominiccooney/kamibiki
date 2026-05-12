@@ -94,10 +94,7 @@ impl Reranker for VoyageReranker {
         }
 
         let resp: VoyageRerankResponse = response.json().await?;
-        eprintln!(
-            "info: reranking used {} tokens",
-            resp.usage.total_tokens
-        );
+        eprintln!("info: reranking used {} tokens", resp.usage.total_tokens);
 
         // Response is already sorted by relevance_score descending.
         let items = resp

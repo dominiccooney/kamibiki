@@ -1,8 +1,9 @@
-pub mod core;
 pub mod chunk;
+pub mod core;
 pub mod embed;
-pub mod snippet;
+pub mod gc;
 pub mod index;
 pub mod ops;
 pub mod search;
 pub mod server;
+pub mod snippet;
