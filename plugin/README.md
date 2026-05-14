@@ -1,0 +1,101 @@
+# Kamibiki Plugin for Cline
+
+A [Cline SDK](https://github.com/cline/cline) plugin that gives your coding agent semantic code search powered by Kamibiki. Instead of grep or text-based search, the agent can ask natural language questions like "how does authentication work" or "where are database connections configured" and get back the most relevant code chunks, ranked by meaning.
+
+The plugin auto-indexes your workspace on each session start (using delta indexing, so only changed files are re-embedded) and exposes a `semantic_search` tool the agent can call at any time.
+
+## Prerequisites
+
+1. Install the `kb` binary:
+
+```sh
+git clone https://github.com/dominiccooney/kamibiki.git
+cd kamibiki
+cargo build --release
+```
+
+Copy `target/release/kb` somewhere on your `PATH`, or note its location for later.
+
+2. Get a [Voyage AI](https://www.voyageai.com/) API key (used for embeddings and reranking).
+
+3. Configure your API key:
+
+```sh
+kb init
+```
+
+This saves the key to `~/.kb.conf`.
+
+4. Verify it works by indexing a repo manually:
+
+```sh
+cd /path/to/your/project
+kb add myproject .
+kb index myproject
+kb search myproject "some concept"
+```
+
+If you see ranked code results, you're good to go.
+
+## Installing the Plugin
+
+Copy `kamibiki.ts` to one of these locations:
+
+For a single project (plugin loads only when working in that project):
+```sh
+cp kamibiki.ts /path/to/your/project/.cline/plugins/kamibiki.ts
+```
+
+For all projects (plugin loads globally):
+```sh
+mkdir -p ~/.cline/plugins
+cp kamibiki.ts ~/.cline/plugins/kamibiki.ts
+```
+
+That's it. Cline auto-discovers plugins in these directories.
+
+## What Happens at Runtime
+
+1. When a Cline session starts, the `beforeRun` hook runs `kb index .` in your workspace. This creates or updates the search index at the current HEAD commit. Delta indexing means only files that changed since the last index are re-embedded, so this is fast after the initial index.
+
+2. The plugin registers the workspace with kamibiki (`kb add . <workspace-path>`) if it hasn't been registered yet. This is idempotent.
+
+3. The agent gets a `semantic_search` tool it can call with a natural language query and an optional result count. Results come back with file paths, line numbers, code snippets, and relevance scores.
+
+## The `semantic_search` Tool
+
+Parameters:
+- `query` (string, required): A natural language or code search query
+- `top` (integer, optional): Number of results to return (default: 10)
+
+Example queries the agent might use:
+- "error handling in the API layer"
+- "how are WebSocket connections managed"
+- "database migration logic"
+- "authentication and session tokens"
+- "rate limiting implementation"
+
+Results include file paths with line numbers, the actual code chunks, and a relevance score from Voyage AI's reranker, so the agent knows exactly where to look and how confident the match is.
+
+## Customization
+
+The plugin is a single TypeScript file. Fork and modify it to fit your workflow:
+
+- Change the number of default results by editing the `default: 10` in the input schema
+- Add a `rule` via `api.registerRule()` to always include certain search context in the system prompt
+- Add an `afterRun` hook to re-index after the agent finishes modifying files
+- Use `api.registerMessageBuilder()` to automatically inject relevant code context into every model request based on the conversation topic
+
+See the [Cline SDK plugin documentation](https://github.com/cline/cline) for the full plugin API.
+
+## How It Works Under the Hood
+
+The plugin shells out to the `kb` CLI binary. When the agent calls `semantic_search`:
+
+1. `kb search . <query>` runs in the workspace directory
+2. Kamibiki embeds the query using Voyage AI (`voyage-code-3` model)
+3. Binary-quantized Hamming distance search finds the top 200 candidates from the local index (no network call, very fast)
+4. Voyage AI's reranker (`rerank-2.5-lite`) scores the candidates for final ranking
+5. Results are returned with file paths, 1-based line numbers, byte offsets, and the actual code content
+
+The search index lives in a `.kb/` directory at the repository root. Each index file (`.kbi`) is a memory-mapped binary format optimized for fast search. Delta indexes only store changed files and point to a parent index, keeping incremental updates cheap. Run `kb gc` periodically to clean up stale index files from old commits.
