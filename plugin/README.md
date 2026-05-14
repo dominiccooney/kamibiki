@@ -56,17 +56,17 @@ That's it. Cline auto-discovers plugins in these directories.
 
 ## What Happens at Runtime
 
-1. When a Cline session starts, the `beforeRun` hook runs `kb index .` in your workspace. This creates or updates the search index at the current HEAD commit. Delta indexing means only files that changed since the last index are re-embedded, so this is fast after the initial index.
+1. When a Cline session starts, the `beforeRun` hook makes sure the workspace is registered, then runs `kb index .` in your workspace. This creates or updates the search index at the current HEAD commit. Delta indexing means only files that changed since the last index are re-embedded, so this is fast after the initial index.
 
-2. The plugin registers the workspace with kamibiki (`kb add . <workspace-path>`) if it hasn't been registered yet. This is idempotent.
+2. The plugin checks `kb status .` first. If the current repository is not registered yet, it registers it with a stable generated name like `cline-myproject-8f2c1d3e4a5b`. It does not claim the global `.` name in `~/.kb.conf`.
 
-3. The agent gets a `semantic_search` tool it can call with a natural language query and an optional result count. Results come back with file paths, line numbers, code snippets, and relevance scores.
+3. The agent gets a `semantic_search` tool it can call with a natural language query and an optional result count. Results come back with file paths, line numbers, code snippets, and relevance scores. If `kb` is not installed, the Voyage AI key is missing, or indexing has not completed, the tool returns a structured error instead of crashing the agent run.
 
 ## The `semantic_search` Tool
 
 Parameters:
 - `query` (string, required): A natural language or code search query
-- `top` (integer, optional): Number of results to return (default: 10)
+- `top` (integer, optional): Number of results to return, from 1 to 50 (default: 10)
 
 Example queries the agent might use:
 - "error handling in the API layer"
@@ -81,7 +81,7 @@ Results include file paths with line numbers, the actual code chunks, and a rele
 
 The plugin is a single TypeScript file. Fork and modify it to fit your workflow:
 
-- Change the number of default results by editing the `default: 10` in the input schema
+- Change the default or maximum result count by editing `DEFAULT_TOP` or `MAX_TOP`
 - Add a `rule` via `api.registerRule()` to always include certain search context in the system prompt
 - Add an `afterRun` hook to re-index after the agent finishes modifying files
 - Use `api.registerMessageBuilder()` to automatically inject relevant code context into every model request based on the conversation topic
@@ -92,7 +92,7 @@ See the [Cline SDK plugin documentation](https://github.com/cline/cline) for the
 
 The plugin shells out to the `kb` CLI binary. When the agent calls `semantic_search`:
 
-1. `kb search . <query>` runs in the workspace directory
+1. `kb search . <query> -n <top>` runs in the workspace directory
 2. Kamibiki embeds the query using Voyage AI (`voyage-code-3` model)
 3. Binary-quantized Hamming distance search finds the top 200 candidates from the local index (no network call, very fast)
 4. Voyage AI's reranker (`rerank-2.5-lite`) scores the candidates for final ranking
