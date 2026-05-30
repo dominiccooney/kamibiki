@@ -499,39 +499,32 @@ fn find_chain_start(
 }
 
 /// Scan all .kbi files in a directory and build a map of
-/// commit hash (hex) → file path. Reads only the first 65 bytes
-/// of each file (version byte + commit hash).
+/// commit hash (hex) → file path, reading only each file's header.
+///
+/// Files whose version is not [`CURRENT_INDEX_VERSION`] are ignored
+/// entirely, so they can never be chosen as a chain start (matching
+/// `MmapIndexReader::open`, which rejects them too).
 fn scan_indexed_commits(kb_dir: &Path) -> Result<HashMap<String, PathBuf>> {
     let mut map = HashMap::new();
     for entry in std::fs::read_dir(kb_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "kbi") {
-            if let Ok(hash) = read_commit_hash_from_header(&path) {
-                if !hash.is_empty() {
-                    map.insert(hash, path);
-                }
-            }
+        if !path.extension().is_some_and(|e| e == "kbi") {
+            continue;
+        }
+        // One open per file; skip obsolete/unreadable headers.
+        let Ok(header) = crate::index::read_header(&path) else {
+            continue;
+        };
+        if header.version != CURRENT_INDEX_VERSION {
+            continue;
+        }
+        let hash = commit_hash_to_hex(&header.commit_hash);
+        if !hash.is_empty() {
+            map.insert(hash, path);
         }
     }
     Ok(map)
-}
-
-/// Read just the commit hash from a .kbi file header without
-/// parsing the rest of the file. Reads exactly `1 + MAX_HASH_LEN`
-/// (65) bytes.
-fn read_commit_hash_from_header(path: &Path) -> Result<String> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
-    let mut buf = [0u8; 1 + MAX_HASH_LEN];
-    file.read_exact(&mut buf)?;
-    // commit_hash starts at byte 1 (after version byte).
-    let hash_bytes = &buf[1..];
-    let end = hash_bytes
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(MAX_HASH_LEN);
-    Ok(String::from_utf8_lossy(&hash_bytes[..end]).into_owned())
 }
 
 /// Extract the commit hash hex string from a GitHash (stored as ASCII
@@ -590,7 +583,7 @@ mod tests {
 
     fn make_header(commit: &str, parent: &str) -> IndexHeader {
         IndexHeader {
-            version: 1,
+            version: CURRENT_INDEX_VERSION,
             commit_hash: make_git_hash(commit),
             parent_hash: make_git_hash(parent),
         }
@@ -867,14 +860,32 @@ mod tests {
     }
 
     #[test]
-    fn read_commit_hash_from_header_works() {
+    fn scan_indexed_commits_reads_current_version() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.kbi");
-
         let header = make_header("deadbeef42", "");
-        write_index(&path, &header, &[]).unwrap();
+        write_index(&dir.path().join("test.kbi"), &header, &[]).unwrap();
 
-        let hash = read_commit_hash_from_header(&path).unwrap();
-        assert_eq!(hash, "deadbeef42");
+        let indexed = scan_indexed_commits(dir.path()).unwrap();
+        assert_eq!(indexed.len(), 1);
+        assert!(indexed.contains_key("deadbeef42"));
+    }
+
+    #[test]
+    fn scan_indexed_commits_skips_legacy_version() {
+        // A file whose version byte is not the current one is treated
+        // as absent, so it can never be chosen as a chain start.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.kbi");
+
+        // Write a valid current-version index, then stomp the version
+        // byte to an older value (1).
+        let header = make_header("cafebabe", "");
+        write_index(&path, &header, &[]).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] = 1;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let indexed = scan_indexed_commits(dir.path()).unwrap();
+        assert!(indexed.is_empty());
     }
 }

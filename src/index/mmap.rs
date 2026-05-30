@@ -28,6 +28,36 @@ pub struct MmapIndexReader {
     total_chunks: usize,
 }
 
+/// Read and parse just the 129-byte header of an index file, without
+/// memory-mapping the whole thing and **without** enforcing the format
+/// version. Callers that need to distinguish an obsolete-but-intact
+/// index from a corrupt one (e.g. gc, re-index) inspect
+/// `header.version` themselves; [`MmapIndexReader::open`] layers the
+/// version check on top.
+///
+/// Returns an error only when the file is missing or too short to hold
+/// a header.
+pub fn read_header(path: &Path) -> Result<IndexHeader> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open index: {}", path.display()))?;
+    let mut buf = [0u8; HEADER_SIZE];
+    file.read_exact(&mut buf)
+        .with_context(|| format!("index file too small for header: {}", path.display()))?;
+
+    let version = buf[0];
+    let mut commit_hash = [0u8; MAX_HASH_LEN];
+    commit_hash.copy_from_slice(&buf[1..1 + MAX_HASH_LEN]);
+    let mut parent_hash = [0u8; MAX_HASH_LEN];
+    parent_hash.copy_from_slice(&buf[1 + MAX_HASH_LEN..HEADER_SIZE]);
+
+    Ok(IndexHeader {
+        version,
+        commit_hash,
+        parent_hash,
+    })
+}
+
 impl MmapIndexReader {
     /// Open an index file at `path` and parse its metadata.
     pub fn open(path: &Path) -> Result<Self> {
@@ -38,8 +68,18 @@ impl MmapIndexReader {
         ensure!(mmap.len() >= HEADER_SIZE, "index file too small for header");
 
         // --- Header ---
+        // Only the current format version is readable. Older versions
+        // (e.g. v1, whose parent_hash links were not git-ancestral) are
+        // rejected so they are treated as absent everywhere index files
+        // are opened — searched chains, parent selection, gc, etc.
         let version = mmap[0];
-        ensure!(version == 1, "unsupported index version: {}", version);
+        ensure!(
+            version == CURRENT_INDEX_VERSION,
+            "unsupported index version: {} (this build reads v{}; \
+             re-index to upgrade)",
+            version,
+            CURRENT_INDEX_VERSION,
+        );
 
         let mut commit_hash = [0u8; MAX_HASH_LEN];
         commit_hash.copy_from_slice(&mmap[1..1 + MAX_HASH_LEN]);
@@ -219,7 +259,7 @@ mod tests {
         let mut parent_hash = [0u8; MAX_HASH_LEN];
         parent_hash[0] = parent;
         IndexHeader {
-            version: 1,
+            version: CURRENT_INDEX_VERSION,
             commit_hash,
             parent_hash,
         }
@@ -239,7 +279,7 @@ mod tests {
         let reader = write_and_read(&header, &[]);
         assert_eq!(reader.embedding_count(), 0);
         assert_eq!(reader.file_count(), 0);
-        assert_eq!(reader.header().version, 1);
+        assert_eq!(reader.header().version, CURRENT_INDEX_VERSION);
         assert_eq!(reader.header().commit_hash[0], 0xAA);
         assert_eq!(reader.parent_hash()[0], 0);
     }

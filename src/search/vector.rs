@@ -151,7 +151,7 @@ mod tests {
 
     fn make_header() -> IndexHeader {
         IndexHeader {
-            version: 1,
+            version: CURRENT_INDEX_VERSION,
             commit_hash: [0; MAX_HASH_LEN],
             parent_hash: [0; MAX_HASH_LEN],
         }

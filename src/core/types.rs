@@ -5,9 +5,24 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum IndexVersion {
-    /// tsv1 chunker + voyage-code-3@2048 binary quantized
+    /// tsv1 chunker + voyage-code-3@2048 binary quantized.
+    ///
+    /// Historical: v1 recorded `parent_hash` as whatever `.kbi` was
+    /// most recently modified at index time, which is *not* a git
+    /// ancestor in general. Chain walks following those links could
+    /// wander into commits unrelated to the search's HEAD. Such files
+    /// are no longer readable and are treated as if absent.
     V1 = 1,
+    /// Same chunker/embedder as v1, but `parent_hash` is guaranteed to
+    /// be the nearest *git ancestor* among indexed commits (or the
+    /// all-zero root). This makes `parent_hash` links safe to follow.
+    V2 = 2,
 }
+
+/// The index format version written by this build. Readers accept
+/// only this version; older files are ignored (treated as absent) so
+/// a format change never silently mixes incompatible semantics.
+pub const CURRENT_INDEX_VERSION: u8 = IndexVersion::V2 as u8;
 
 /// The maximum git hash size we support (SHA-256).
 pub const MAX_HASH_LEN: usize = 64;
@@ -20,7 +35,8 @@ pub type GitHash = [u8; MAX_HASH_LEN];
 #[derive(Debug, Clone)]
 #[repr(C, packed)]
 pub struct IndexHeader {
-    /// Index version / format. Currently always 1.
+    /// Index version / format. See [`IndexVersion`];
+    /// [`CURRENT_INDEX_VERSION`] is what this build writes.
     pub version: u8,
     /// The git commit hash this index was created at.
     pub commit_hash: GitHash,

@@ -162,6 +162,24 @@ pub async fn index_repo(
 
     let index_path = kb_dir.join(format!("{}.kbi", &commit_hex[..commit_hex.len().min(16)]));
 
+    // If an index already exists at this commit but in an obsolete
+    // format version, it is unusable (the reader ignores it) and must
+    // not be mistaken for a resumable skeleton — otherwise we'd parse
+    // its body with current-version assumptions and, worse, finish it
+    // while leaving the old version byte in place, so search keeps
+    // rejecting it. Remove it up front and rebuild cleanly.
+    if let Ok(existing) = index::read_header(&index_path) {
+        if existing.version != CURRENT_INDEX_VERSION {
+            progress.on_message(&format!(
+                "Existing index at this commit is an obsolete format (v{}); rebuilding.",
+                existing.version,
+            ));
+            std::fs::remove_file(&index_path).with_context(|| {
+                format!("failed to remove obsolete index {}", index_path.display())
+            })?;
+        }
+    }
+
     // ── Determine work path ──────────────────────────────────
     //
     // For non-compact indexing we read, resume, and write directly
@@ -245,15 +263,18 @@ pub async fn index_repo(
         // layout with parent_hash = 0. Reusable embeddings are
         // still pulled from the existing file (if any) and from
         // the newest other index, via `prefill_sources`.
-        let parent_info = if compact {
-            // For compact, we still want the most recent *other*
-            // index (not the file we're about to replace) as an
-            // embedding source — delta-style matching by path and
-            // chunk text. Don't record it as the header parent.
-            find_parent_index_info(&kb_dir, &[&index_path, &compact_work_path, &work_path])
+        // The parent is always the nearest git ancestor that is
+        // indexed. In delta mode it becomes the recorded `parent_hash`
+        // (so it must be a true ancestor, or chain walks at search time
+        // would wander onto unrelated branches); in compact mode it is
+        // an additional embedding-reuse source. Using git ancestry for
+        // both keeps selection simple and consistent.
+        let exclude: &[&Path] = if compact {
+            &[&index_path, &compact_work_path, &work_path]
         } else {
-            find_parent_index_info(&kb_dir, &[&index_path])
+            &[&index_path]
         };
+        let parent_info = find_parent_index_info(&repo, &kb_dir, &commit_hex, exclude);
 
         let (infos, parent_hash) = if compact {
             // Compact: chunk every tracked file at the target commit.
@@ -346,7 +367,7 @@ pub async fn index_repo(
             .copy_from_slice(&hex_bytes[..hex_bytes.len().min(MAX_HASH_LEN)]);
 
         let header = IndexHeader {
-            version: 1,
+            version: CURRENT_INDEX_VERSION,
             commit_hash,
             parent_hash,
         };
@@ -777,42 +798,68 @@ pub fn chunk_all_files(
     Ok(file_infos)
 }
 
-/// Find the most recent existing index file to use as a parent for
-/// delta indexing. Returns `(path, commit_hex)` of the parent index,
+/// Find the existing index to use as a delta parent for the commit
+/// being indexed. Returns `(path, commit_hex)` of the parent index,
 /// or `None` if no suitable parent exists.
-fn find_parent_index_info(kb_dir: &Path, exclude: &[&Path]) -> Option<(PathBuf, String)> {
-    let mut kbi_files: Vec<_> = std::fs::read_dir(kb_dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            let p = e.path();
-            p.extension().is_some_and(|ext| ext == "kbi")
-                && !exclude.iter().any(|x| *x == p.as_path())
-        })
-        .collect();
-
-    if kbi_files.is_empty() {
+///
+/// The parent is the **nearest git ancestor** of `target_commit_hex`
+/// that has an index file — not merely the most recently modified
+/// `.kbi`. This guarantees the recorded `parent_hash` is a real
+/// ancestor, so chain walks at search time stay on `target`'s
+/// history instead of wandering onto unrelated branches.
+///
+/// Selection walks `target`'s ancestors newest-first (a cheap git DAG
+/// traversal) and returns the first ancestor that maps to a usable
+/// (current-version) index, skipping `exclude`d paths and the target
+/// commit itself. Files that fail to open (e.g. legacy versions) are
+/// invisible here because they never enter `indexed_by_commit`.
+fn find_parent_index_info(
+    repo: &gix::Repository,
+    kb_dir: &Path,
+    target_commit_hex: &str,
+    exclude: &[&Path],
+) -> Option<(PathBuf, String)> {
+    // Map indexed commit hex → path, restricted to openable (current
+    // version) index files that aren't excluded.
+    let mut indexed_by_commit: HashMap<String, PathBuf> = HashMap::new();
+    for entry in std::fs::read_dir(kb_dir).ok()?.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.extension().is_some_and(|ext| ext == "kbi") {
+            continue;
+        }
+        if exclude.iter().any(|x| *x == path.as_path()) {
+            continue;
+        }
+        let Ok(reader) = MmapIndexReader::open(&path) else {
+            continue; // unreadable / legacy version → treat as absent
+        };
+        let hex = commit_hash_to_hex(&reader.header().commit_hash);
+        if !hex.is_empty() {
+            indexed_by_commit.entry(hex).or_insert(path);
+        }
+    }
+    if indexed_by_commit.is_empty() {
         return None;
     }
 
-    // Most recent first.
-    kbi_files.sort_by_key(|e| {
-        std::cmp::Reverse(
-            e.metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-        )
-    });
-
-    let path = kbi_files[0].path();
-    let reader = MmapIndexReader::open(&path).ok()?;
-    let commit_hex = commit_hash_to_hex(&reader.header().commit_hash);
-
-    if commit_hex.is_empty() {
-        return None;
+    // Walk target's ancestors newest-first; return the first that is
+    // indexed. Skip the target commit itself: a parent must be a
+    // strict ancestor so the delta diff (parent → target) is non-empty
+    // and the chain makes progress.
+    let target_oid = gix::ObjectId::from_hex(target_commit_hex.as_bytes()).ok()?;
+    let walk = repo.rev_walk([target_oid]).all().ok()?;
+    for info in walk {
+        let info = info.ok()?;
+        let hex = info.id.to_hex().to_string();
+        if hex == target_commit_hex {
+            continue;
+        }
+        if let Some(path) = indexed_by_commit.get(&hex) {
+            return Some((path.clone(), hex));
+        }
     }
 
-    Some((path, commit_hex))
+    None
 }
 
 /// Extract the commit hash hex string from a GitHash.

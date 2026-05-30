@@ -65,4 +65,4 @@ pub use format::{
     IndexLayout, detect_incomplete, index_layout, read_file_infos, write_embeddings_at,
     write_embeddings_scattered, write_index, write_skeleton,
 };
-pub use mmap::MmapIndexReader;
+pub use mmap::{MmapIndexReader, read_header};

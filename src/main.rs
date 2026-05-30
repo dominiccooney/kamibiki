@@ -579,15 +579,18 @@ fn cmd_gc(name: Option<&str>, dry_run: bool) -> Result<()> {
             format_bytes(plan.bytes_freed()),
         );
         for entry in &plan.to_delete {
-            let commit = if entry.commit_hex.is_empty() {
-                "<unreadable>".to_string()
+            // Show commit when we have one, otherwise the reason label
+            // (e.g. obsolete format / unreadable) so the deletion is
+            // self-explanatory rather than an anonymous "<unreadable>".
+            let detail = if entry.commit_hex.is_empty() {
+                entry.reason.label().to_string()
             } else {
-                short_hex(&entry.commit_hex)
+                format!("commit {}, {}", short_hex(&entry.commit_hex), entry.reason.label())
             };
             println!(
-                "    {} (commit {}, {})",
+                "    {} ({}, {})",
                 entry.path.display(),
-                commit,
+                detail,
                 format_bytes(entry.size)
             );
         }

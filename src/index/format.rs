@@ -389,14 +389,14 @@ pub fn read_file_infos(data: &[u8], git_entries: &[(usize, String)]) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::{BinaryEmbedding, GitHash};
+    use crate::core::types::{BinaryEmbedding, CURRENT_INDEX_VERSION, GitHash};
     use crate::index::ChunkEntry;
 
     fn make_header() -> IndexHeader {
         let mut commit_hash: GitHash = [0; MAX_HASH_LEN];
         commit_hash[..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
         IndexHeader {
-            version: 1,
+            version: CURRENT_INDEX_VERSION,
             commit_hash,
             parent_hash: [0; MAX_HASH_LEN],
         }
@@ -513,7 +513,7 @@ mod tests {
         let data = encode_index(&header, &entries).unwrap();
 
         // Verify header
-        assert_eq!(data[0], 1);
+        assert_eq!(data[0], CURRENT_INDEX_VERSION);
         assert_eq!(&data[1..5], &[0xDE, 0xAD, 0xBE, 0xEF]);
 
         // Verify offset table decodes correctly
