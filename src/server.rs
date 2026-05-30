@@ -158,7 +158,7 @@ fn handle_tools_list(id: &Value) -> Value {
     );
 
     let index_desc = format!(
-        "Update the search index for one or more repositories. This chunks files, computes embeddings via the Voyage AI API, and writes the index. Supports delta indexing (only changed files are re-embedded). This operation can take seconds to minutes depending on repository size and number of changes. The operation is restartable: if interrupted, re-running will resume from where it left off.{}",
+        "Update the search index for one or more repositories. This chunks files, computes embeddings via the Voyage AI API, and writes the index. Supports delta indexing (only changed files are re-embedded). This operation usually takes a few seconds, but can take minutes depending on the number of changes. Having an up-to-date index is worth it. The operation is restartable: if interrupted, re-running will resume from where it left off.{}",
         repo_listing
     );
     json!({
