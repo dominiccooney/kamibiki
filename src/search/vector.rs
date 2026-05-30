@@ -2,8 +2,25 @@ use std::collections::BinaryHeap;
 
 use anyhow::Result;
 
-use crate::core::types::{BinaryEmbedding, VectorSearchResult};
+use crate::core::types::{BinaryEmbedding, EMBEDDING_BYTES, VectorSearchResult};
 use crate::index::IndexReader;
+
+/// The outcome of a single-index vector search: the top-N results
+/// plus whether any embedding slot scanned was all-zero, which marks
+/// the index as incompletely embedded (a skeleton whose embeddings
+/// were not all filled in — e.g. an interrupted indexing run).
+///
+/// `saw_incomplete` reflects the index file as a whole and is
+/// independent of `top_n` (the loop scans every embedding) and of any
+/// later shadowing, so it is stable across queries against the same
+/// index file.
+#[derive(Debug, Default)]
+pub struct VectorSearchOutcome {
+    /// Top-N results, closest first.
+    pub results: Vec<VectorSearchResult>,
+    /// True if at least one all-zero (unfilled) embedding was seen.
+    pub saw_incomplete: bool,
+}
 
 /// Compute the Hamming distance between two binary embeddings.
 ///
@@ -44,22 +61,45 @@ impl PartialOrd for HeapEntry {
 }
 
 /// Search the index for the top N nearest embeddings by Hamming
-/// distance. Returns results sorted by distance (closest first).
+/// distance. Returns the results (sorted by distance, closest first)
+/// together with a flag indicating whether any unfilled (all-zero)
+/// embedding slot was encountered — see [`VectorSearchOutcome`].
+///
+/// Unfilled slots are detected cheaply: an all-zero stored embedding
+/// has `hamming_distance(query, zero) == popcount(query)`, a constant
+/// for the whole search. We compare each computed distance against
+/// that constant and only do the byte-level confirmation on the
+/// (astronomically rare) match, so the common all-filled case adds no
+/// measurable cost. Detected zero slots are excluded from the result
+/// heap so a placeholder never surfaces as a (bogus) nearest result.
 pub fn vector_search(
     query_embedding: &BinaryEmbedding,
     index: &dyn IndexReader,
     top_n: usize,
-) -> Result<Vec<VectorSearchResult>> {
+) -> Result<VectorSearchOutcome> {
     let count = index.embedding_count();
     if count == 0 || top_n == 0 {
-        return Ok(Vec::new());
+        return Ok(VectorSearchOutcome::default());
     }
+
+    // popcount(query) == hamming_distance(query, all-zero). A stored
+    // all-zero embedding therefore yields exactly this distance.
+    let zero: BinaryEmbedding = [0u8; EMBEDDING_BYTES];
+    let query_popcount = hamming_distance(query_embedding, &zero);
+    let mut saw_incomplete = false;
 
     let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(top_n + 1);
 
     for i in 0..count {
         let emb = index.embedding(i);
         let dist = hamming_distance(query_embedding, emb);
+
+        // Cheap gate, then confirm: skip unfilled placeholder slots so
+        // they neither pollute results nor go unnoticed.
+        if dist == query_popcount && emb.iter().all(|&b| b == 0) {
+            saw_incomplete = true;
+            continue;
+        }
 
         // Only insert if better than the worst in a full heap.
         if heap.len() < top_n {
@@ -91,7 +131,10 @@ pub fn vector_search(
         .collect::<Result<Vec<_>>>()?;
 
     results.sort_by_key(|r| r.hamming_distance);
-    Ok(results)
+    Ok(VectorSearchOutcome {
+        results,
+        saw_incomplete,
+    })
 }
 
 #[cfg(test)]
@@ -160,8 +203,9 @@ mod tests {
         let reader = MmapIndexReader::open(&path).unwrap();
 
         let query = make_embedding(0xFF);
-        let results = vector_search(&query, &reader, 10).unwrap();
-        assert!(results.is_empty());
+        let outcome = vector_search(&query, &reader, 10).unwrap();
+        assert!(outcome.results.is_empty());
+        assert!(!outcome.saw_incomplete);
     }
 
     #[test]
@@ -201,7 +245,10 @@ mod tests {
         let reader = MmapIndexReader::open(&path).unwrap();
 
         let query = make_embedding(0xFF);
-        let results = vector_search(&query, &reader, 2).unwrap();
+        let VectorSearchOutcome {
+            results,
+            saw_incomplete,
+        } = vector_search(&query, &reader, 2).unwrap();
 
         assert_eq!(results.len(), 2);
         // First result should be the closest (distance 0).
@@ -210,6 +257,10 @@ mod tests {
         // Second should be 0xFE (distance 256).
         assert_eq!(results[1].hamming_distance, 256);
         assert_eq!(results[1].chunk_ref.file_index, 2);
+        // The 0x00 embedding looks like an unfilled slot to this query
+        // (all-zero), so it is treated as incomplete and skipped rather
+        // than returned as a (bogus) distance-2048 result.
+        assert!(saw_incomplete);
     }
 
     #[test]
@@ -218,21 +269,23 @@ mod tests {
         let path = dir.path().join("test.kbi");
         let header = make_header();
 
+        // Embeddings 0x10..0x1a — all non-zero so none is mistaken for
+        // an unfilled (all-zero) placeholder slot.
         let entries: Vec<FileEntry> = (0..10)
             .map(|i| FileEntry {
                 git_index_position: i,
                 chunks: vec![ChunkEntry {
                     byte_offset: 0,
                     chunk_len: 100,
-                    embedding: make_embedding(i as u8),
+                    embedding: make_embedding(0x10 + i as u8),
                 }],
             })
             .collect();
         write_index(&path, &header, &entries).unwrap();
         let reader = MmapIndexReader::open(&path).unwrap();
 
-        let query = make_embedding(0);
-        let results = vector_search(&query, &reader, 3).unwrap();
+        let query = make_embedding(0x10);
+        let results = vector_search(&query, &reader, 3).unwrap().results;
         assert_eq!(results.len(), 3);
     }
 
@@ -254,8 +307,72 @@ mod tests {
         let reader = MmapIndexReader::open(&path).unwrap();
 
         let query = make_embedding(0x42);
-        let results = vector_search(&query, &reader, 100).unwrap();
+        let results = vector_search(&query, &reader, 100).unwrap().results;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].hamming_distance, 0);
+    }
+
+    #[test]
+    fn vector_search_flags_unfilled_slot() {
+        // One real embedding plus one all-zero (skeleton placeholder)
+        // slot. The search should report `saw_incomplete`, skip the
+        // placeholder, and return only the real result.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.kbi");
+        let header = make_header();
+
+        let entries = vec![FileEntry {
+            git_index_position: 0,
+            chunks: vec![
+                ChunkEntry {
+                    byte_offset: 0,
+                    chunk_len: 100,
+                    embedding: make_embedding(0x42),
+                },
+                ChunkEntry {
+                    byte_offset: 100,
+                    chunk_len: 100,
+                    embedding: [0u8; EMBEDDING_BYTES], // unfilled placeholder
+                },
+            ],
+        }];
+        write_index(&path, &header, &entries).unwrap();
+        let reader = MmapIndexReader::open(&path).unwrap();
+
+        // Non-zero query so only the genuinely all-zero slot trips the
+        // detector.
+        let query = make_embedding(0x42);
+        let VectorSearchOutcome {
+            results,
+            saw_incomplete,
+        } = vector_search(&query, &reader, 10).unwrap();
+
+        assert!(saw_incomplete);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk_ref.chunk_index, 0);
+        assert_eq!(results[0].hamming_distance, 0);
+    }
+
+    #[test]
+    fn vector_search_complete_index_not_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.kbi");
+        let header = make_header();
+
+        let entries = vec![FileEntry {
+            git_index_position: 0,
+            chunks: vec![ChunkEntry {
+                byte_offset: 0,
+                chunk_len: 100,
+                embedding: make_embedding(0x42),
+            }],
+        }];
+        write_index(&path, &header, &entries).unwrap();
+        let reader = MmapIndexReader::open(&path).unwrap();
+
+        let query = make_embedding(0x01);
+        let outcome = vector_search(&query, &reader, 10).unwrap();
+        assert!(!outcome.saw_incomplete);
+        assert_eq!(outcome.results.len(), 1);
     }
 }

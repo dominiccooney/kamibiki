@@ -21,6 +21,24 @@ pub struct IndexChain {
     pub commits_behind: usize,
 }
 
+/// The outcome of a chain search: the merged, shadow-resolved results
+/// plus the set of indexed commits whose `.kbi` files were found to be
+/// incompletely embedded (some embedding slots still zero, e.g. from
+/// an interrupted indexing run).
+///
+/// `incomplete_commits` is reported per index file, independent of
+/// shadowing and of the query, so it is stable across searches against
+/// the same set of index files. An incomplete commit can sit anywhere
+/// in the chain, not just at the search's starting commit. The list is
+/// deduplicated and ordered newest→oldest (chain order).
+#[derive(Debug, Default)]
+pub struct ChainSearchOutcome {
+    /// Merged results, closest first, with shadowing applied.
+    pub results: Vec<ChainSearchResult>,
+    /// Commit hexes whose index files had unfilled embedding slots.
+    pub incomplete_commits: Vec<String>,
+}
+
 /// A search result from chain search, with path and commit already resolved.
 #[derive(Debug, Clone)]
 pub struct ChainSearchResult {
@@ -247,26 +265,39 @@ pub fn chain_search(
     query_embedding: &BinaryEmbedding,
     top_n: usize,
     dir_filter: &DirFilter,
-) -> Result<Vec<ChainSearchResult>> {
+) -> Result<ChainSearchOutcome> {
     if readers.is_empty() || top_n == 0 {
-        return Ok(Vec::new());
+        return Ok(ChainSearchOutcome::default());
     }
 
-    // Phase 1: Search all indexes in parallel.
-    let per_index_results: Vec<Vec<VectorSearchResult>> = readers
+    // Phase 1: Search all indexes in parallel. Each entry carries the
+    // per-index results and whether that index had unfilled slots.
+    let per_index: Vec<(Vec<VectorSearchResult>, bool)> = readers
         .par_iter()
         .map(|reader| {
             let n = top_n.min(reader.embedding_count());
-            vector_search(query_embedding, reader, n).unwrap_or_default()
+            match vector_search(query_embedding, reader, n) {
+                Ok(outcome) => (outcome.results, outcome.saw_incomplete),
+                Err(_) => (Vec::new(), false),
+            }
         })
         .collect();
 
     // Phase 2: Walk newest → oldest, resolve paths, filter shadowed.
     let mut shadowed_paths: HashSet<String> = HashSet::new();
     let mut all_results: Vec<ChainSearchResult> = Vec::new();
+    let mut incomplete_commits: Vec<String> = Vec::new();
 
-    for (i, (reader, results)) in readers.iter().zip(per_index_results).enumerate() {
+    for (i, (reader, (results, saw_incomplete))) in readers.iter().zip(per_index).enumerate() {
         let commit_hex = commit_hash_to_hex(&reader.header().commit_hash);
+
+        // Record incompleteness per index file (commit), independent of
+        // shadowing and the query. Dedup defensively in case a commit
+        // appears more than once in the chain.
+        if saw_incomplete && !incomplete_commits.contains(&commit_hex) {
+            incomplete_commits.push(commit_hex.clone());
+        }
+
         let entries = git::entries_at_commit(repo, &commit_hex)
             .with_context(|| format!("failed to get entries at commit {}", &commit_hex))?;
 
@@ -321,7 +352,10 @@ pub fn chain_search(
     // Sort by hamming distance (closest first) and take top_n.
     all_results.sort_by_key(|r| r.hamming_distance);
     all_results.truncate(top_n);
-    Ok(all_results)
+    Ok(ChainSearchOutcome {
+        results: all_results,
+        incomplete_commits,
+    })
 }
 
 /// Load the chain of index files starting from the most recent

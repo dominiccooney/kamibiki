@@ -39,7 +39,8 @@ use crate::embed::{Embedder, VoyageEmbedder};
 use crate::index::{IndexReader, MmapIndexReader};
 use crate::ops::{self, StderrProgress};
 use crate::search::{
-    DirFilter, IndexChain, Reranker, VoyageReranker, chain_search, load_index_chain,
+    ChainSearchOutcome, DirFilter, IndexChain, Reranker, VoyageReranker, chain_search,
+    load_index_chain,
 };
 
 // ── MCP stdio server ─────────────────────────────────────────────
@@ -475,9 +476,20 @@ async fn tool_search(args: &Value) -> Result<String> {
     let dir_filter = DirFilter::from_user_input(&dirs, &exclude_dirs, &repo_root, &filter_cwd);
 
     let vector_top_n = 200;
-    let vector_results = chain_search(&chain, &repo, &query_embedding, vector_top_n, &dir_filter)?;
+    let ChainSearchOutcome {
+        results: vector_results,
+        incomplete_commits,
+    } = chain_search(&chain, &repo, &query_embedding, vector_top_n, &dir_filter)?;
 
     if vector_results.is_empty() {
+        // Even with no results, surface incompleteness so the caller
+        // knows the search may have been degraded by an unfinished index.
+        if !incomplete_commits.is_empty() {
+            return Ok(format!(
+                "No results found.\n\n{}",
+                format_incomplete_note(&incomplete_commits)
+            ));
+        }
         return Ok("No results found.".to_string());
     }
 
@@ -515,11 +527,17 @@ async fn tool_search(args: &Value) -> Result<String> {
 
     if commits_behind > 0 {
         output.push_str(&format!(
-            "Note: index is {} commit{} behind {}. Run 'kb index' to update.\n\n",
+            "Note: index is {} commit{} behind {} ({}). Run 'kb index' to update.\n\n",
             commits_behind,
             if commits_behind == 1 { "" } else { "s" },
             ref_label,
+            short_hex(&resolved_commit),
         ));
+    }
+
+    if !incomplete_commits.is_empty() {
+        output.push_str(&format_incomplete_note(&incomplete_commits));
+        output.push_str("\n\n");
     }
 
     for (rank, item) in reranked.iter().enumerate() {
@@ -828,6 +846,30 @@ fn resolve_names(cfg: &KbConfig, names: &[String]) -> Result<Vec<String>> {
     Ok(result)
 }
 
+/// Shorten a commit hex to a 12-character display prefix.
+fn short_hex(hex: &str) -> &str {
+    &hex[..hex.len().min(12)]
+}
+
+/// Build a human-readable note naming each commit whose index is
+/// incompletely embedded, with the exact command to finish it. One
+/// line per commit so the caller can act on each without guessing.
+fn format_incomplete_note(incomplete_commits: &[String]) -> String {
+    let mut s = String::new();
+    for (i, hex) in incomplete_commits.iter().enumerate() {
+        if i > 0 {
+            s.push('\n');
+        }
+        s.push_str(&format!(
+            "Note: index incomplete for commit {} — some embeddings are missing. \
+             Run 'kb index --commit {}' to finish.",
+            short_hex(hex),
+            short_hex(hex),
+        ));
+    }
+    s
+}
+
 fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{} B", bytes)
@@ -843,4 +885,36 @@ fn format_bytes(bytes: u64) -> String {
 fn commit_hash_to_hex(hash: &GitHash) -> String {
     let end = hash.iter().position(|&b| b == 0).unwrap_or(hash.len());
     String::from_utf8_lossy(&hash[..end]).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_hex_truncates_to_twelve() {
+        assert_eq!(short_hex("0123456789abcdef0123"), "0123456789ab");
+        assert_eq!(short_hex("abc"), "abc");
+        assert_eq!(short_hex(""), "");
+    }
+
+    #[test]
+    fn format_incomplete_note_one_commit() {
+        let note = format_incomplete_note(&["abcdef1234567890".to_string()]);
+        assert!(note.contains("commit abcdef123456 "));
+        assert!(note.contains("kb index --commit abcdef123456"));
+        // Single commit → single line.
+        assert_eq!(note.lines().count(), 1);
+    }
+
+    #[test]
+    fn format_incomplete_note_multiple_commits_one_line_each() {
+        let note = format_incomplete_note(&[
+            "1111111111111111".to_string(),
+            "2222222222222222".to_string(),
+        ]);
+        assert_eq!(note.lines().count(), 2);
+        assert!(note.contains("kb index --commit 111111111111"));
+        assert!(note.contains("kb index --commit 222222222222"));
+    }
 }

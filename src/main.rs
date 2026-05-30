@@ -12,7 +12,10 @@ use kb::embed::{Embedder, VoyageEmbedder};
 use kb::gc;
 use kb::index::{IndexReader, MmapIndexReader};
 use kb::ops::{self, IndexProgress};
-use kb::search::{DirFilter, IndexChain, Reranker, VoyageReranker, chain_search, load_index_chain};
+use kb::search::{
+    ChainSearchOutcome, DirFilter, IndexChain, Reranker, VoyageReranker, chain_search,
+    load_index_chain,
+};
 use kb::snippet;
 
 #[derive(Parser)]
@@ -695,7 +698,21 @@ async fn cmd_search(
     }
 
     let vector_top_n = 200;
-    let vector_results = chain_search(&chain, &repo, &query_embedding, vector_top_n, &dir_filter)?;
+    let ChainSearchOutcome {
+        results: vector_results,
+        incomplete_commits,
+    } = chain_search(&chain, &repo, &query_embedding, vector_top_n, &dir_filter)?;
+
+    // Report any incompletely-embedded indexes encountered, naming the
+    // exact commit and the command to finish it. Stable across queries.
+    for hex in &incomplete_commits {
+        let short = &hex[..hex.len().min(12)];
+        eprintln!(
+            "Note: index incomplete for commit {} — some embeddings are missing. \
+             Run 'kb index --commit {}' to finish.",
+            short, short,
+        );
+    }
 
     if vector_results.is_empty() {
         eprintln!("No results found.");
