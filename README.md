@@ -15,6 +15,16 @@ search from the command line or as an MCP server for coding agents.
 
 ### Install
 
+The quickest way is to install directly from the git repository with
+Cargo, which builds the `kb` binary and places it in `~/.cargo/bin`
+(make sure that's on your `PATH`):
+
+```sh
+cargo install --git https://github.com/dominiccooney/kamibiki.git
+```
+
+Alternatively, clone and build from source:
+
 ```sh
 git clone https://github.com/dominiccooney/kamibiki.git
 cd kamibiki
