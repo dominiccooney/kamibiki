@@ -37,16 +37,216 @@ pub struct ChainSearchResult {
     pub commit_hex: String,
 }
 
+/// A pair of repository-root-relative directory prefixes that scope a
+/// search: results must live under one of `include` (when non-empty)
+/// and must not live under any of `exclude`. Exclusion takes
+/// precedence over inclusion.
+///
+/// Prefixes are interpreted as git-style, forward-slash, repo-relative
+/// directory paths (e.g. `src/search`). They are matched on whole path
+/// segments, so `src/app` matches `src/app/x.rs` but not
+/// `src/apple/x.rs`.
+#[derive(Debug, Default, Clone)]
+pub struct DirFilter {
+    /// Restrict to files under these directories. Empty = no restriction.
+    pub include: Vec<String>,
+    /// Exclude files under these directories. Always applied.
+    pub exclude: Vec<String>,
+}
+
+impl DirFilter {
+    /// Build a filter from raw include/exclude prefixes, normalizing
+    /// each by trimming surrounding slashes and dropping empties.
+    ///
+    /// Prefixes here are assumed to already be repository-root-relative
+    /// (git-style). Use [`DirFilter::from_user_input`] to accept the
+    /// looser set of paths a human might type.
+    pub fn new(include: &[String], exclude: &[String]) -> Self {
+        DirFilter {
+            include: normalize_dirs(include),
+            exclude: normalize_dirs(exclude),
+        }
+    }
+
+    /// Build a filter from directory arguments as a user might type
+    /// them — absolute paths, paths relative to their current working
+    /// directory, or already-repo-relative paths — by relativizing
+    /// each against the repository root.
+    ///
+    /// `repo_root` is the worktree root (where repo-relative chunk
+    /// paths are anchored) and `cwd` is the directory the user is
+    /// operating from (used to resolve relative inputs). Both should be
+    /// absolute; callers typically canonicalize them first so symlinks
+    /// resolve consistently. The user-supplied paths themselves are
+    /// only normalized *lexically* (`.`/`..` collapsed as text), never
+    /// canonicalized — so a directory that does not exist on disk
+    /// (because an earlier `--commit` is being searched) still
+    /// relativizes correctly.
+    ///
+    /// Inputs that resolve to a location outside the repository are
+    /// dropped: they can never match a repo-relative chunk path.
+    pub fn from_user_input(
+        include: &[String],
+        exclude: &[String],
+        repo_root: &Path,
+        cwd: &Path,
+    ) -> Self {
+        let relativize = |dirs: &[String]| -> Vec<String> {
+            dirs.iter()
+                .filter_map(|d| relativize_dir(d, repo_root, cwd))
+                .collect()
+        };
+        // Re-run through `new` so the repo-relative results are
+        // normalized (trimmed, `.`/empty dropped) identically.
+        DirFilter::new(&relativize(include), &relativize(exclude))
+    }
+
+    /// Returns true when no include or exclude prefixes are set, so the
+    /// filter accepts every path and matching can be skipped entirely.
+    pub fn is_empty(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
+
+    /// Decide whether a repo-relative `path` passes the filter.
+    ///
+    /// A path is accepted when it is *not* under any `exclude` prefix
+    /// (exclusion wins) and, if `include` is non-empty, is under at
+    /// least one `include` prefix.
+    pub fn accepts(&self, path: &str) -> bool {
+        if self.exclude.iter().any(|d| path_under_dir(path, d)) {
+            return false;
+        }
+        if self.include.is_empty() {
+            return true;
+        }
+        self.include.iter().any(|d| path_under_dir(path, d))
+    }
+}
+
+/// Normalize a list of directory prefixes: trim surrounding slashes so
+/// a chunk path matches when it equals the directory or is nested
+/// beneath it, and drop entries that normalize to empty (e.g. `.` or
+/// the repo root itself, which would match everything).
+fn normalize_dirs(dirs: &[String]) -> Vec<String> {
+    dirs.iter()
+        .map(|d| d.trim_matches('/').to_string())
+        .filter(|d| !d.is_empty() && d != ".")
+        .collect()
+}
+
+/// Whole-segment prefix match: true when `path` equals `dir` or sits
+/// beneath it. `dir` is assumed already normalized (no surrounding
+/// slashes). The trailing-slash comparison prevents `src/app` from
+/// matching `src/apple`.
+fn path_under_dir(path: &str, dir: &str) -> bool {
+    if path == dir {
+        return true;
+    }
+    let mut prefix = String::with_capacity(dir.len() + 1);
+    prefix.push_str(dir);
+    prefix.push('/');
+    path.starts_with(&prefix)
+}
+
+/// Collapse `.` and `..` segments in a path purely lexically (without
+/// touching the filesystem), returning the cleaned, forward-slash
+/// component list. A leading `..` that would escape the path is kept
+/// so callers can detect an out-of-bounds result.
+fn lexical_components(path: &Path) -> Vec<String> {
+    use std::path::Component;
+    let mut out: Vec<String> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Pop a real segment if there is one; otherwise keep the
+                // `..` so an escaping path stays detectably out of range.
+                if matches!(out.last().map(String::as_str), Some("..") | None) {
+                    out.push("..".to_string());
+                } else {
+                    out.pop();
+                }
+            }
+            Component::Normal(s) => out.push(s.to_string_lossy().into_owned()),
+            // Root / prefix components are dropped: we only care about
+            // the portion of the path relative to the repo root.
+            Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    out
+}
+
+/// Relativize a single user-supplied directory argument to a
+/// repository-root-relative, forward-slash prefix.
+///
+/// * Absolute inputs are made relative to `repo_root`.
+/// * Relative inputs are first tried relative to `cwd`; if that lands
+///   inside the repo, that interpretation wins. Otherwise the input is
+///   treated as already repo-root-relative.
+///
+/// All path math is lexical (no `canonicalize`), so inputs that do not
+/// exist on disk still relativize. Returns `None` when the result
+/// would fall outside the repository.
+fn relativize_dir(input: &str, repo_root: &Path, cwd: &Path) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let raw = Path::new(trimmed);
+
+    // Resolve to an absolute, lexically-cleaned component list.
+    let abs_components = if raw.is_absolute() {
+        lexical_components(raw)
+    } else {
+        // Prefer cwd-relative resolution; fall back to repo-relative.
+        let cwd_joined = lexical_components(&cwd.join(raw));
+        let root_components = lexical_components(repo_root);
+        if starts_with_components(&cwd_joined, &root_components) {
+            cwd_joined
+        } else {
+            // Treat as already repo-relative: anchor at the repo root
+            // and re-collapse so any `.`/`..` resolve against the root
+            // (and an escaping input stays outside, to be rejected
+            // below).
+            lexical_components(&repo_root.join(raw))
+        }
+    };
+
+    let root_components = lexical_components(repo_root);
+    strip_prefix_components(&abs_components, &root_components).map(|rel| rel.join("/"))
+}
+
+/// True when `components` begins with every element of `prefix`.
+fn starts_with_components(components: &[String], prefix: &[String]) -> bool {
+    components.len() >= prefix.len() && components[..prefix.len()] == *prefix
+}
+
+/// Strip `prefix` from the front of `components`, returning the
+/// remainder. Returns `None` when `components` does not start with
+/// `prefix` (i.e. the path is outside the repository root).
+fn strip_prefix_components(components: &[String], prefix: &[String]) -> Option<Vec<String>> {
+    if starts_with_components(components, prefix) {
+        Some(components[prefix.len()..].to_vec())
+    } else {
+        None
+    }
+}
+
 /// Search a chain of indexes (newest first) for the top N results,
 /// with proper shadowing of files covered by newer delta indexes.
 ///
 /// Indexes are searched in parallel for speed, then results are
 /// filtered sequentially to apply shadowing logic.
+///
+/// `dir_filter` optionally restricts results to (or away from)
+/// specific directories. When it is empty, the whole repository is
+/// searched. See [`DirFilter`] for matching semantics.
 pub fn chain_search(
     readers: &[MmapIndexReader],
     repo: &gix::Repository,
     query_embedding: &BinaryEmbedding,
     top_n: usize,
+    dir_filter: &DirFilter,
 ) -> Result<Vec<ChainSearchResult>> {
     if readers.is_empty() || top_n == 0 {
         return Ok(Vec::new());
@@ -76,11 +276,12 @@ pub fn chain_search(
             .map(|(pos, path)| (*pos, path.as_str()))
             .collect();
 
-        // Filter results: keep only those whose path is not shadowed.
+        // Filter results: keep only those whose path is not shadowed
+        // and that pass the directory filter.
         for result in results {
             let file_pos = result.chunk_ref.file_index as usize;
             if let Some(path) = pos_to_path.get(&file_pos) {
-                if !shadowed_paths.contains(*path) {
+                if !shadowed_paths.contains(*path) && dir_filter.accepts(path) {
                     all_results.push(ChainSearchResult {
                         path: path.to_string(),
                         byte_offset: result.chunk_ref.byte_offset,
@@ -497,6 +698,138 @@ mod tests {
         assert_eq!(indexed.len(), 2);
         assert!(indexed.contains_key("aaaa1111"));
         assert!(indexed.contains_key("bbbb2222"));
+    }
+
+    #[test]
+    fn dir_filter_empty_accepts_everything() {
+        let f = DirFilter::new(&[], &[]);
+        assert!(f.is_empty());
+        assert!(f.accepts("src/main.rs"));
+        assert!(f.accepts("README.md"));
+    }
+
+    #[test]
+    fn dir_filter_include_scopes_to_subtree() {
+        let f = DirFilter::new(&["src/search".to_string()], &[]);
+        assert!(!f.is_empty());
+        assert!(f.accepts("src/search/chain.rs"));
+        assert!(f.accepts("src/search")); // the directory itself
+        assert!(!f.accepts("src/server.rs"));
+        assert!(!f.accepts("README.md"));
+    }
+
+    #[test]
+    fn dir_filter_include_matches_whole_segments() {
+        // `src/app` must not match `src/apple`.
+        let f = DirFilter::new(&["src/app".to_string()], &[]);
+        assert!(f.accepts("src/app/main.rs"));
+        assert!(!f.accepts("src/apple/main.rs"));
+    }
+
+    #[test]
+    fn dir_filter_exclude_removes_subtree() {
+        let f = DirFilter::new(&[], &["target".to_string()]);
+        assert!(f.accepts("src/main.rs"));
+        assert!(!f.accepts("target/debug/foo"));
+        assert!(!f.accepts("target")); // the directory itself
+    }
+
+    #[test]
+    fn dir_filter_exclude_wins_over_include() {
+        // Precedence: a path under both include and exclude is excluded.
+        let f = DirFilter::new(&["src".to_string()], &["src/generated".to_string()]);
+        assert!(f.accepts("src/main.rs"));
+        assert!(!f.accepts("src/generated/proto.rs"));
+        assert!(!f.accepts("docs/guide.md")); // not under include
+    }
+
+    #[test]
+    fn relativize_absolute_path_inside_repo() {
+        let root = Path::new("/home/me/proj");
+        let cwd = Path::new("/home/me/proj/src");
+        assert_eq!(
+            relativize_dir("/home/me/proj/src/search", root, cwd),
+            Some("src/search".to_string())
+        );
+    }
+
+    #[test]
+    fn relativize_relative_path_against_cwd() {
+        let root = Path::new("/home/me/proj");
+        let cwd = Path::new("/home/me/proj/src");
+        // "search" relative to cwd is proj/src/search.
+        assert_eq!(
+            relativize_dir("search", root, cwd),
+            Some("src/search".to_string())
+        );
+        // ".." walks up from src to the repo root.
+        assert_eq!(relativize_dir("../docs", root, cwd), Some("docs".to_string()));
+    }
+
+    #[test]
+    fn relativize_repo_relative_fallback() {
+        // When cwd is the repo root, a bare relative path is already
+        // repo-relative.
+        let root = Path::new("/home/me/proj");
+        let cwd = Path::new("/home/me/proj");
+        assert_eq!(
+            relativize_dir("src/search", root, cwd),
+            Some("src/search".to_string())
+        );
+    }
+
+    #[test]
+    fn relativize_nonexistent_path_for_earlier_commit() {
+        // The path need not exist on disk: relativization is lexical.
+        let root = Path::new("/home/me/proj");
+        let cwd = Path::new("/home/me/proj");
+        assert_eq!(
+            relativize_dir("legacy/removed_module", root, cwd),
+            Some("legacy/removed_module".to_string())
+        );
+    }
+
+    #[test]
+    fn relativize_outside_repo_is_dropped() {
+        let root = Path::new("/home/me/proj");
+        let cwd = Path::new("/home/me/proj/src");
+        // Absolute path outside the repo.
+        assert_eq!(relativize_dir("/etc/passwd", root, cwd), None);
+        // Relative path that escapes the repo root.
+        assert_eq!(relativize_dir("../../other", root, cwd), None);
+    }
+
+    #[test]
+    fn from_user_input_builds_relativized_filter() {
+        let root = Path::new("/home/me/proj");
+        let cwd = Path::new("/home/me/proj/src");
+        let f = DirFilter::from_user_input(
+            &["/home/me/proj/src/search".to_string(), "index".to_string()],
+            &["../target".to_string()],
+            root,
+            cwd,
+        );
+        assert_eq!(
+            f.include,
+            vec!["src/search".to_string(), "src/index".to_string()]
+        );
+        assert_eq!(f.exclude, vec!["target".to_string()]);
+        assert!(f.accepts("src/search/vector.rs"));
+        assert!(f.accepts("src/index/mod.rs"));
+        assert!(!f.accepts("src/server.rs"));
+        assert!(!f.accepts("target/debug/x"));
+    }
+
+    #[test]
+    fn dir_filter_normalizes_surrounding_slashes_and_dot() {
+        // Leading/trailing slashes are trimmed; "." and "" are dropped.
+        let f = DirFilter::new(
+            &["/src/search/".to_string(), ".".to_string(), String::new()],
+            &[],
+        );
+        assert_eq!(f.include, vec!["src/search".to_string()]);
+        assert!(f.accepts("src/search/vector.rs"));
+        assert!(!f.accepts("src/index/mod.rs"));
     }
 
     #[test]

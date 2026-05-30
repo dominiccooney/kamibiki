@@ -19,13 +19,28 @@ fn parse_cwd(args: &Value) -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+/// Parse an array-of-strings argument (e.g. `dirs`) from the JSON-RPC
+/// arguments, returning an empty vector when absent or malformed.
+fn parse_string_array(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 use crate::core::config;
 use crate::core::git;
 use crate::core::types::*;
 use crate::embed::{Embedder, VoyageEmbedder};
 use crate::index::{IndexReader, MmapIndexReader};
 use crate::ops::{self, StderrProgress};
-use crate::search::{IndexChain, Reranker, VoyageReranker, chain_search, load_index_chain};
+use crate::search::{
+    DirFilter, IndexChain, Reranker, VoyageReranker, chain_search, load_index_chain,
+};
 
 // ── MCP stdio server ─────────────────────────────────────────────
 
@@ -189,9 +204,19 @@ fn handle_tools_list(id: &Value) -> Value {
                                 "type": "string",
                                 "description": "Git revision to search from (commit hash, branch name, tag, HEAD~1, etc.). Defaults to HEAD when not specified."
                             },
+                            "dirs": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Restrict results to these directories. Accepts absolute, cwd-relative, or repository-relative paths; each is relativized against the repository root. Directories need not exist on disk (useful with an earlier 'commit'). Omit or leave empty to search the whole repository."
+                            },
+                            "exclude_dirs": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Exclude results under these directories. Same path forms as 'dirs'. Exclusions take precedence over 'dirs'."
+                            },
                             "cwd": {
                                 "type": "string",
-                                "description": "Absolute path used to resolve '.' as a repository name. Required when name='.' — typically the client's current working directory. If the path is inside a git worktree, the appropriate registered repository is selected and the worktree's HEAD is used for revision resolution. Ignored when name is not '.'."
+                                "description": "Absolute path used to resolve '.' as a repository name, and to relativize relative 'dirs'/'exclude_dirs'. Required when name='.' — typically the client's current working directory. If the path is inside a git worktree, the appropriate registered repository is selected and the worktree's HEAD is used for revision resolution."
                             }
                         },
                         "required": ["name", "query"]
@@ -403,6 +428,8 @@ async fn tool_search(args: &Value) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("missing required parameter: query"))?;
     let top = args.get("top").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
     let commit = args.get("commit").and_then(|v| v.as_str());
+    let dirs = parse_string_array(args, "dirs");
+    let exclude_dirs = parse_string_array(args, "exclude_dirs");
     let cwd = parse_cwd(args);
 
     let cfg = config::load_config()?;
@@ -434,8 +461,21 @@ async fn tool_search(args: &Value) -> Result<String> {
     let embedder = VoyageEmbedder::new(api_key.clone());
     let query_embedding = embedder.embed_query(query).await?;
 
+    // Build the directory filter. Relative dirs are resolved against
+    // the client's working directory (the `cwd` argument) when given,
+    // falling back to the worktree root; both are relativized against
+    // the repository root the chunk paths are anchored to.
+    let repo_root = repo
+        .workdir()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| worktree_path.clone());
+    let repo_root = std::fs::canonicalize(&repo_root).unwrap_or(repo_root);
+    let filter_cwd = cwd.clone().unwrap_or_else(|| worktree_path.clone());
+    let filter_cwd = std::fs::canonicalize(&filter_cwd).unwrap_or(filter_cwd);
+    let dir_filter = DirFilter::from_user_input(&dirs, &exclude_dirs, &repo_root, &filter_cwd);
+
     let vector_top_n = 200;
-    let vector_results = chain_search(&chain, &repo, &query_embedding, vector_top_n)?;
+    let vector_results = chain_search(&chain, &repo, &query_embedding, vector_top_n, &dir_filter)?;
 
     if vector_results.is_empty() {
         return Ok("No results found.".to_string());

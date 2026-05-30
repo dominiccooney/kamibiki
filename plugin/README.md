@@ -67,6 +67,10 @@ That's it. Cline auto-discovers plugins in these directories.
 Parameters:
 - `query` (string, required): A natural language or code search query
 - `top` (integer, optional): Number of results to return, from 1 to 50 (default: 10)
+- `dirs` (string[], optional): Directories to focus the search on. Accepts absolute, cwd-relative, or repository-relative paths; each is relativized against the repository root by the `kb` CLI. Omit to search the whole repository.
+- `exclude_dirs` (string[], optional): Directories to exclude from results. Same path forms as `dirs`. Exclusions take precedence over `dirs`.
+
+This mirrors the `kb` CLI flags exactly: each `dirs` entry becomes a repeatable `--dir`, and each `exclude_dirs` entry becomes a repeatable `--exclude-dir`. Scoping a search to the relevant part of a large monorepo dramatically improves result quality.
 
 Example queries the agent might use:
 - "error handling in the API layer"
@@ -87,6 +91,22 @@ The plugin is a single TypeScript file. Fork and modify it to fit your workflow:
 - Use `api.registerMessageBuilder()` to automatically inject relevant code context into every model request based on the conversation topic
 
 See the [Cline SDK plugin documentation](https://github.com/cline/cline) for the full plugin API.
+
+## Development
+
+The plugin targets `@cline/core` `0.0.42`. To work on it locally:
+
+```sh
+cd plugin
+bun install
+bun run typecheck   # type-checks against the @cline/core SDK
+bun test            # runs the unit tests
+```
+
+The tests live in `kamibiki.test.ts` and cover the pure
+argument-building logic (`buildSearchArgs`) — including result-count
+clamping and the `--dir` / `--exclude-dir` flag mapping — so they run
+without a `kb` binary or a model.
 
 ## How It Works Under the Hood
 

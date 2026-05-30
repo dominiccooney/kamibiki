@@ -1,3 +1,4 @@
 /target/
 .kb/
 *~
+node_modules/

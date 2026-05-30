@@ -8,6 +8,7 @@ const exec = promisify(execFile)
 
 const DEFAULT_TOP = 10
 const MAX_TOP = 50
+const MAX_DIRS = 50
 const DEFAULT_SESSION_KEY = "__default__"
 
 interface WorkspaceState {
@@ -19,6 +20,8 @@ interface WorkspaceState {
 interface SemanticSearchInput {
 	query: string
 	top?: number
+	dirs?: string[]
+	exclude_dirs?: string[]
 }
 
 interface CommandError {
@@ -70,6 +73,49 @@ function normalizeTop(top: number | undefined): number {
 	if (top === undefined) return DEFAULT_TOP
 	if (!Number.isFinite(top)) return DEFAULT_TOP
 	return Math.min(Math.max(Math.trunc(top), 1), MAX_TOP)
+}
+
+/**
+ * Normalize a directory list argument: keep only non-empty trimmed
+ * strings, capped at MAX_DIRS. Returns an empty array for anything
+ * that is not an array of strings (e.g. undefined or malformed input).
+ */
+function normalizeDirs(dirs: unknown): string[] {
+	if (!Array.isArray(dirs)) return []
+	const out: string[] = []
+	for (const d of dirs) {
+		if (typeof d !== "string") continue
+		const trimmed = d.trim()
+		if (trimmed) out.push(trimmed)
+		if (out.length >= MAX_DIRS) break
+	}
+	return out
+}
+
+/**
+ * Build the `kb search` argument list from validated tool input.
+ *
+ * Mirrors the kamibiki CLI/MCP directory-scoping contract:
+ *   - each `dirs` entry becomes a repeatable `--dir <path>` flag
+ *   - each `exclude_dirs` entry becomes a repeatable `--exclude-dir <path>`
+ *
+ * The CLI relativizes these paths against the repository root, so the
+ * agent may pass absolute, cwd-relative, or repo-relative directories.
+ */
+export function buildSearchArgs(input: {
+	query: string
+	top?: number
+	dirs?: string[]
+	exclude_dirs?: string[]
+}): string[] {
+	const args = ["search", ".", input.query.trim(), "-n", String(normalizeTop(input.top))]
+	for (const dir of normalizeDirs(input.dirs)) {
+		args.push("--dir", dir)
+	}
+	for (const dir of normalizeDirs(input.exclude_dirs)) {
+		args.push("--exclude-dir", dir)
+	}
+	return args
 }
 
 function stringify(value: unknown): string | undefined {
@@ -156,7 +202,7 @@ const plugin: AgentPlugin = {
 		fallbackState = state
 
 		api.registerTool(
-			createTool<SemanticSearchInput, CommandResult | CommandErrorResult>({
+			createTool({
 				name: "semantic_search",
 				description:
 					"Search the codebase semantically with a natural language query. " +
@@ -179,13 +225,32 @@ const plugin: AgentPlugin = {
 							minimum: 1,
 							maximum: MAX_TOP,
 						},
+						dirs: {
+							type: "array",
+							items: { type: "string" },
+							description:
+								"Restrict results to these directories to focus the search. " +
+								"Accepts absolute, cwd-relative, or repository-relative paths; " +
+								"each is relativized against the repository root. " +
+								"Omit or leave empty to search the whole repository.",
+						},
+						exclude_dirs: {
+							type: "array",
+							items: { type: "string" },
+							description:
+								"Exclude results under these directories. Same path forms as 'dirs'. " +
+								"Exclusions take precedence over 'dirs'.",
+						},
 					},
 					required: ["query"],
 					additionalProperties: false,
 				},
 				timeoutMs: 120_000,
-				async execute(input: SemanticSearchInput, context: AgentToolContext) {
-					const { query, top } = input
+				async execute(
+					rawInput: unknown,
+					context: AgentToolContext,
+				): Promise<CommandResult | CommandErrorResult> {
+					const { query, top, dirs, exclude_dirs } = rawInput as SemanticSearchInput
 					const currentState = getState(context.sessionId)
 					if (!currentState) {
 						return {
@@ -205,13 +270,12 @@ const plugin: AgentPlugin = {
 
 					try {
 						await ensureStateRegistered(currentState)
-						const args = [
-							"search",
-							".",
-							trimmedQuery,
-							"-n",
-							String(normalizeTop(top)),
-						]
+						const args = buildSearchArgs({
+							query: trimmedQuery,
+							top,
+							dirs,
+							exclude_dirs,
+						})
 						const output = await kb(args, currentState.cwd)
 						return { content: output, repoName: currentState.repoName }
 					} catch (error) {
@@ -223,15 +287,20 @@ const plugin: AgentPlugin = {
 	},
 
 	hooks: {
-		async beforeRun({ snapshot }: BeforeRunContext) {
-			const currentState = getState(snapshot.sessionId)
-			if (!currentState) return
+		async beforeRun(_context: BeforeRunContext): Promise<undefined> {
+			// The run lifecycle snapshot does not carry the core session
+			// id, so fall back to the most recently registered workspace
+			// state (set in `setup`). This matches the single-session
+			// host that auto-indexes the active workspace.
+			const currentState = getState(undefined)
+			if (!currentState) return undefined
 			try {
 				await ensureStateRegistered(currentState)
 				await kb(["index", "."], currentState.cwd)
 			} catch {
 				// The search tool returns structured errors if kb is unavailable or unconfigured.
 			}
+			return undefined
 		},
 	},
 }

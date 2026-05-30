@@ -12,7 +12,7 @@ use kb::embed::{Embedder, VoyageEmbedder};
 use kb::gc;
 use kb::index::{IndexReader, MmapIndexReader};
 use kb::ops::{self, IndexProgress};
-use kb::search::{IndexChain, Reranker, VoyageReranker, chain_search, load_index_chain};
+use kb::search::{DirFilter, IndexChain, Reranker, VoyageReranker, chain_search, load_index_chain};
 use kb::snippet;
 
 #[derive(Parser)]
@@ -60,6 +60,16 @@ enum Commands {
         /// Defaults to HEAD when not specified.
         #[arg(short, long)]
         commit: Option<String>,
+        /// Restrict results to a directory (repeatable). Accepts
+        /// absolute, cwd-relative, or repo-relative paths; each is
+        /// relativized against the repository root. The directory need
+        /// not exist on disk (useful with an earlier --commit).
+        #[arg(short = 'd', long = "dir", value_name = "DIR")]
+        dirs: Vec<String>,
+        /// Exclude results under a directory (repeatable). Same path
+        /// forms as --dir. Exclusions take precedence over --dir.
+        #[arg(long = "exclude-dir", value_name = "DIR")]
+        exclude_dirs: Vec<String>,
     },
     /// Create a repository alias
     Alias { name: String, repos: Vec<String> },
@@ -142,9 +152,18 @@ fn main() -> Result<()> {
             query,
             top,
             commit,
+            dirs,
+            exclude_dirs,
         } => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(cmd_search(&name, &query, top, commit.as_deref()))
+            rt.block_on(cmd_search(
+                &name,
+                &query,
+                top,
+                commit.as_deref(),
+                &dirs,
+                &exclude_dirs,
+            ))
         }
         Commands::Alias { name, repos } => cmd_alias(&name, &repos),
         Commands::Drop { name } => cmd_drop(&name),
@@ -602,7 +621,14 @@ fn short_hex(hex: &str) -> String {
 
 // ── kb search ────────────────────────────────────────────────────
 
-async fn cmd_search(name: &str, query: &str, top: usize, commit: Option<&str>) -> Result<()> {
+async fn cmd_search(
+    name: &str,
+    query: &str,
+    top: usize,
+    commit: Option<&str>,
+    dirs: &[String],
+    exclude_dirs: &[String],
+) -> Result<()> {
     let cfg = config::load_config()?;
     let api_key = cfg
         .voyage_api_key
@@ -650,8 +676,26 @@ async fn cmd_search(name: &str, query: &str, top: usize, commit: Option<&str>) -
     let embedder = VoyageEmbedder::new(api_key.clone());
     let query_embedding = embedder.embed_query(query).await?;
 
+    // Build the directory filter, relativizing user-supplied paths
+    // (absolute, cwd-relative, or repo-relative) against the worktree
+    // root the search is anchored to.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| worktree_path.clone());
+    let repo_root = repo
+        .workdir()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| worktree_path.clone());
+    let repo_root = std::fs::canonicalize(&repo_root).unwrap_or(repo_root);
+    let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let dir_filter = DirFilter::from_user_input(dirs, exclude_dirs, &repo_root, &cwd);
+    if !dir_filter.is_empty() {
+        eprintln!(
+            "Restricting to directories: include={:?} exclude={:?}",
+            dir_filter.include, dir_filter.exclude,
+        );
+    }
+
     let vector_top_n = 200;
-    let vector_results = chain_search(&chain, &repo, &query_embedding, vector_top_n)?;
+    let vector_results = chain_search(&chain, &repo, &query_embedding, vector_top_n, &dir_filter)?;
 
     if vector_results.is_empty() {
         eprintln!("No results found.");

@@ -118,6 +118,20 @@ Use `.` as the name to search the repository in the current directory:
 kb search . "database connection pooling"
 ```
 
+Use `--dir` to focus the search on one or more directories, and
+`--exclude-dir` to leave parts of the tree out. Both flags are
+repeatable and accept absolute, cwd-relative, or repo-relative paths
+(each is relativized against the repository root). Exclusions take
+precedence over inclusions:
+
+```sh
+kb search . "request validation" --dir src/api --dir src/web --exclude-dir src/api/generated
+```
+
+Because the paths are relativized rather than resolved on disk, you
+can scope a search at an earlier `--commit` even if the directory no
+longer exists in your working tree.
+
 ### Check status
 
 ```sh
@@ -136,7 +150,7 @@ commit, and embedding count.
 | `kb add <name> <path>` | Register a git repository for indexing |
 | `kb index [names...] [-c commit]` | Update the index (delta-aware, restartable) |
 | `kb status [name]` | Show indexing status |
-| `kb search <name> <query> [-n top] [-c commit]` | Search a repository |
+| `kb search <name> <query> [-n top] [-c commit] [--dir d] [--exclude-dir d]` | Search a repository |
 | `kb alias <name> <repos...>` | Create a shorthand for a group of repositories |
 | `kb drop <name>` | Delete all index files for a repository |
 | `kb gc [name] [--dry-run]` | Delete index files for commits no longer known to git |
@@ -172,6 +186,11 @@ query. Parameters:
 - `top` (optional): number of results, default 10
 - `commit` (optional): git revision to search from (commit hash,
   branch name, tag, `HEAD~1`, etc.). Defaults to HEAD.
+- `dirs` (optional): array of directories to focus the search on
+  (absolute, cwd-relative, or repo-relative; relativized against the
+  repository root). Omit for the whole repository.
+- `exclude_dirs` (optional): array of directories to exclude. Same
+  path forms as `dirs`. Exclusions take precedence over `dirs`.
 
 **kb_status** — Show indexing status of registered repositories.
 Parameters:
