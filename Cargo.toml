@@ -30,6 +30,9 @@ indicatif = "0.17"
 ordered-float = "5"
 rayon = "1"
 tokenizers = { version = "0.22", features = ["http"] }
+# tokenizers downloads through hf-hub/ureq. Enable native roots on that shared
+# ureq instance so SSL_CERT_FILE and the OS trust store can include local CAs.
+ureq = { version = "2.12.1", default-features = false, features = ["native-certs"] }
 dirs = "6"
 toml = "0.8"
 
